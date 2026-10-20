@@ -1,0 +1,12 @@
+node_modules/
+dist/
+data/
+tmp/
+*.bak-*
+STATUS.md
+BUGS_FOUND.md
+.env
+*.env
+*.tmp
+*.log
+STATUS*.md

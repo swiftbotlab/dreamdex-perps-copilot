@@ -1,0 +1,24 @@
+[Unit]
+Description=Perps Copilot for dreamDEX (Telegram bot, Somnia Tokyo testnet; long polling, outbound only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/agent/agent/products/dreamdex-mvp
+# Filesystem isolation = bwrap (ops/run_sandboxed.sh); egress allowlist + no subprocesses = ops/guard.cjs.
+# systemd namespace directives are not used: the per-user manager on this host silently ignores them.
+ExecStart=/home/agent/agent/products/dreamdex-mvp/ops/run_sandboxed.sh bot
+Restart=always
+RestartSec=15
+RestartPreventExitStatus=2
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+MemoryMax=700M
+TasksMax=64
+
+[Install]
+WantedBy=default.target

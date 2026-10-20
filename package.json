@@ -1,0 +1,25 @@
+{
+  "name": "dreamdex-perps-copilot",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Telegram perps copilot for dreamDEX traders on Somnia Tokyo testnet (Hideki, chain 50383).",
+  "license": "MIT",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --import tsx --test test/*.test.ts",
+    "doctor": "node --import tsx src/doctor.ts",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@resvg/resvg-wasm": "2.6.2",
+    "@somnia-chain/markets-sdk": "0.31.0",
+    "viem": "2.54.1"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "esbuild": "0.28.2",
+    "tsx": "4.22.4",
+    "typescript": "5.9.3"
+  }
+}
