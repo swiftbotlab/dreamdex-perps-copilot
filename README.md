@@ -89,10 +89,11 @@ All orders below were placed **by the bot**, through a bot key linked with the a
 
 ## X posts
 
-<!-- 2-3 posts about the MVP tagging @DreamDEXSomnia go here -->
-- (link to post 1)
-- (link to post 2)
-- (link to post 3)
+Posts about Perps Copilot that tag @DreamDEXSomnia:
+
+1. Launch, with a real PnL card from a closed testnet trade (2026-10-20): https://x.com/swiftbotlab/status/2112551079061889196
+2. (next post)
+3. (next post)
 
 ## Run it yourself
 
