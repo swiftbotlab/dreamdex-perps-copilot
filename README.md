@@ -93,7 +93,7 @@ Posts about Perps Copilot that tag @DreamDEXSomnia:
 
 1. Launch, with a real PnL card from a closed testnet trade (2026-10-20): https://x.com/swiftbotlab/status/2112551079061889196
 2. Proof clip, stop-loss closed by the bot + /card (2026-10-21): https://x.com/swiftbotlab/status/2112695927035371609
-3. (next post)
+3. How the bot trades your account without custody (Link a bot, Somnia Reactivity marks) (2026-10-21): https://x.com/swiftbotlab/status/2112829373846094160
 
 ## Run it yourself
 
