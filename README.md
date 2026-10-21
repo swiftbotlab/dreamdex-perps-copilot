@@ -92,7 +92,7 @@ All orders below were placed **by the bot**, through a bot key linked with the a
 Posts about Perps Copilot that tag @DreamDEXSomnia:
 
 1. Launch, with a real PnL card from a closed testnet trade (2026-10-20): https://x.com/swiftbotlab/status/2112551079061889196
-2. (next post)
+2. Proof clip, stop-loss closed by the bot + /card (2026-10-21): https://x.com/swiftbotlab/status/2112695927035371609
 3. (next post)
 
 ## Run it yourself
