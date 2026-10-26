@@ -14,15 +14,28 @@ const mkt = (pool: string) => ({ display: "SOL-PERP", symbol: "SOL/USDso:USDso",
 const M = mkt("0x1111111111111111111111111111111111111111");
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** A TradingKey whose clients are fakes: each step can be made to fail. */
-function fakeKey(o: { simulate?: () => Promise<unknown>; write?: () => Promise<string>; wait?: (a: { hash: string; timeout?: number }) => Promise<unknown> } = {}, operator = "0x00000000000000000000000000000000000000b1") {
+/**
+ * A TradingKey whose clients are fakes: each step can be made to fail. `write` runs where the signed
+ * transaction is posted (sendRawTransaction; writeContract on the pre-fix path). `nonce` is the node's
+ * pending count; `post(n)` sees the nonce each posted transaction carries.
+ */
+type Fake = { simulate?: () => Promise<unknown>; write?: () => Promise<unknown>; wait?: (a: { hash: string; timeout?: number }) => Promise<unknown>; nonce?: () => Promise<number>; prepare?: () => Promise<void>; post?: (n: number) => Promise<void> };
+function fakeKey(o: Fake = {}, operator = "0x00000000000000000000000000000000000000b1") {
+  const waited: string[] = [];
   return {
-    owner: OWNER, operator, account: { address: operator },
+    owner: OWNER, operator, account: { address: operator }, waited,
     publicClient: {
       simulateContract: async () => (o.simulate ? o.simulate() : { request: {} }),
-      waitForTransactionReceipt: async (a: { hash: string; timeout?: number }) => (o.wait ? o.wait(a) : { status: "success", logs: [] }),
+      getTransactionCount: async () => (o.nonce ? o.nonce() : 0),
+      waitForTransactionReceipt: async (a: { hash: string; timeout?: number }) => { waited.push(a.hash); return o.wait ? o.wait(a) : { status: "success", logs: [] }; },
     },
-    walletClient: { writeContract: async () => (o.write ? o.write() : HASH) },
+    walletClient: {
+      chain: V.chain,
+      prepareTransactionRequest: async (r: { nonce: number }) => { await o.prepare?.(); return r; },
+      signTransaction: async (r: { nonce: number }) => `0x${r.nonce.toString(16).padStart(4, "0")}`,
+      sendRawTransaction: async ({ serializedTransaction: tx }: { serializedTransaction: string }) => { if (o.write) await o.write(); await o.post?.(parseInt(tx.slice(2), 16)); return HASH; },
+      writeContract: async () => (o.write ? o.write() : HASH),
+    },
   };
 }
 const send = (v: any, tk: unknown, m = M) => v.send(tk, m, "long", 1n, 1n) as Promise<unknown>;
@@ -36,43 +49,60 @@ test("T1a (control): a simulate-time revert says nothing was sent", async () => 
 
 test("T1b: tx posted, receipt wait times out -> outcome unknown with the hash, never 'Nothing was sent'", async () => {
   let timeoutSeen: number | undefined;
-  const e = await errOf(send(new V.Venue(), fakeKey({ wait: async (a) => { timeoutSeen = a.timeout; throw new Error(`Timed out while waiting for transaction with hash "${a.hash}" to be confirmed.`); } })));
+  const tk = fakeKey({ wait: async (a) => { timeoutSeen = a.timeout; throw new Error(`Timed out while waiting for transaction with hash "${a.hash}" to be confirmed.`); } });
+  const e = await errOf(send(new V.Venue(), tk));
+  const hash = tk.waited[0]!; // the hash of the signed transaction, known before it was posted
+  assert.match(hash, /^0x[0-9a-f]{64}$/);
   assert.doesNotMatch(e.message, /Nothing was sent/);
-  assert.match(e.message, new RegExp(HASH));
+  assert.match(e.message, new RegExp(hash));
   assert.match(e.message, /will not resend/);
   assert.ok(V.OutcomeUnknown && e instanceof V.OutcomeUnknown);
-  assert.equal(e.hash, HASH);
+  assert.equal(e.hash, hash);
   assert.equal(timeoutSeen, 60_000);
 });
 
-test("T1c: the raw send fails ('already known') -> outcome unknown, never 'Nothing was sent'", async () => {
+test("T1c: the raw send fails ('already known') -> outcome unknown with the signed tx's hash, never 'Nothing was sent'", async () => {
   const e = await errOf(send(new V.Venue(), fakeKey({ write: async () => { throw new Error("already known"); } })));
   assert.ok(e instanceof V.OutcomeUnknown);
   assert.doesNotMatch(e.message, /Nothing was sent/);
   assert.match(e.message, /could not confirm/);
+  assert.match(String(e.hash), /^0x[0-9a-f]{64}$/);
+  assert.ok(e.message.includes(String(e.hash)));
+});
+
+test("T1c (control): a failure while preparing (before anything is signed or posted) says nothing was sent", async () => {
+  let posted = 0;
+  const e = await errOf(send(new V.Venue(), fakeKey({ prepare: async () => { throw new Error("HTTP request failed. Status: 503"); }, post: async () => { posted++; } })));
+  assert.ok(!(e instanceof V.OutcomeUnknown));
+  assert.match(e.message, /Nothing was sent/);
+  assert.equal(posted, 0);
 });
 
 test("T1d: a node 'insufficient funds' refusal of the raw tx and a mined revert keep their exact meaning", async () => {
   const gas = await errOf(send(new V.Venue(), fakeKey({ write: async () => { throw new Error("insufficient funds for gas * price + value"); } })));
   assert.ok(!(gas instanceof V.OutcomeUnknown));
   assert.match(gas.message, /no STT for gas/);
-  const rev = await errOf(send(new V.Venue(), fakeKey({ wait: async () => ({ status: "reverted", logs: [] }) })));
+  const rk = fakeKey({ wait: async () => ({ status: "reverted", logs: [] }) });
+  const rev = await errOf(send(new V.Venue(), rk));
   assert.ok(!(rev instanceof V.OutcomeUnknown));
-  assert.match(rev.message, new RegExp(`reverted on chain: tx ${HASH}`));
+  assert.match(rev.message, new RegExp(`reverted on chain: tx ${rk.waited[0]}`));
 });
 
-test("T1e: writes are never retried by the transport; reads keep viem's retries", async () => {
+test("T1e: both clients keep viem's retries for reads (nonce, fees, chain id); the signed tx is posted by sendRawTransaction, which viem never retries", async () => {
   const { createTradingKey } = await import("../src/vendor/perp-core/operator.ts");
   const { generatePrivateKey } = await import("viem/accounts");
   const tk = createTradingKey({ owner: OWNER, privateKey: generatePrivateKey(), chain: V.chain, rpcUrl: "http://127.0.0.1:9" });
-  assert.equal((tk.walletClient.transport as { retryCount?: number }).retryCount, 0);
+  assert.equal((tk.walletClient.transport as { retryCount?: number }).retryCount, 3);
   assert.equal((tk.publicClient.transport as { retryCount?: number }).retryCount, 3);
+  // viem 2.54.1 posts eth_sendRawTransaction with retryCount 0 per request (F8 in review-fixes proves it against a stub RPC).
+  const src = readFileSync(new URL("../node_modules/viem/_esm/actions/wallet/sendRawTransaction.js", import.meta.url), "utf8");
+  assert.match(src, /method: 'eth_sendRawTransaction'[\s\S]*\{ retryCount: 0 \}/);
 });
 
-/** writeContract reads the key's nonce, waits, then increments it: overlapping sends of one key collide. */
+/** The node's pending nonce per key; a post takes 40 ms and then bumps it: overlapping sends of one key collide. */
 function nonceKeys() {
   const nonce = new Map<string, number>(), used: number[] = [];
-  const key = (op: string) => fakeKey({ write: async () => { const n = nonce.get(op) ?? 0; await sleep(40); used.push(n); nonce.set(op, n + 1); return HASH; } }, op);
+  const key = (op: string) => fakeKey({ nonce: async () => nonce.get(op) ?? 0, post: async (n) => { await sleep(40); used.push(n); nonce.set(op, Math.max(nonce.get(op) ?? 0, n + 1)); } }, op);
   return { key, used };
 }
 
@@ -159,7 +189,7 @@ test("unknown close outcome: logged as 'unknown', the same size is blocked for 2
   assert.match(warn, /not confirmed yet/);
   assert.doesNotMatch(warn, /keep retrying/);
   // The Protector's next attempt within 20 s reads the same size: refused before anything is sent.
-  await assert.rejects(h.bot.doClose(u, 2, "ETH", 1, "stop-loss", { expectSide: "long", auto: true }), /just went through/);
+  await assert.rejects(h.bot.doClose(u, 2, "ETH", 1, "stop-loss", { expectSide: "long", auto: true }), /may have gone through/);
   assert.equal(sends, 1); // the guard refused before the fake's send step
   const rows = readFileSync(`${H.PATHS.data}/orders.jsonl`, "utf8").trim().split("\n").map((l) => JSON.parse(l));
   assert.deepEqual(rows.map((r) => [r.kind, r.intent, r.hash, r.market, r.side]), [["unknown", "close", H.HASH, "ETH-PERP", "short"]]);

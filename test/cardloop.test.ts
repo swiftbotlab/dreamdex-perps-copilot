@@ -48,7 +48,7 @@ test("T5: a new user from /start c_<id>: refBy, pendingCopy, counters, ONE share
   assert.equal(u.pendingCopy?.card, card.id);
   assert.deepEqual([card.newUsers, card.taps, card.copies], [1, 1, 0]);
   assert.equal(pingsTo(h, SHARER).length, 1);
-  assert.match(pingsTo(h, SHARER)[0]!.html, /SOL card brought a new trader/);
+  assert.match(pingsTo(h, SHARER)[0]!.html, /SOL card brought a new user/);
   const landing = h.to(200).find((x) => /Shared trade/.test(x.html))!;
   assert.match(landing.html, /SOL-PERP long 5x · entry 100\.000 → exit 104\.000/);
   assert.equal(h.cbData(landing).filter((d) => d.startsWith("cm:")).length, 0, "no trade buttons before linking");
@@ -195,7 +195,7 @@ test("/invite shows the r_ link, joins through links and cards, and 30-day card 
   const s = h.to(SHARER).at(-1)!.html;
   assert.match(s, new RegExp(`start=r_${h.bot.store.get(SHARER).ref}`));
   assert.match(s, /joined through your links and cards: 1/);
-  assert.match(s, /Cards made: 1 · taps: 1 · new traders: 1 · copies: 0/);
+  assert.match(s, /Cards made: 1 · taps: 1 · new users: 1 · copies: 0/);
   assert.ok(!s.includes(HASH));
 });
 

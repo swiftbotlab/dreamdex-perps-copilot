@@ -183,24 +183,56 @@ export class Venue {
     return alignPrice(side === "long" ? (raw * (10_000n + bps)) / 10_000n : (raw * (10_000n - bps)) / 10_000n, m.info);
   }
 
+  /** The IOC limit: touch +/- slippage, and with `capPct` never further than that from the mark (card copies). */
+  private limitPrice(m: PerpMarket, side: Side, touch: number, mark: number, capPct?: number): bigint {
+    const p = this.slipPrice(m, side, touch);
+    if (capPct === undefined) return p;
+    const raw = toRaw(mark * (1 + (side === "long" ? capPct : -capPct) / 100), 18);
+    const tick = BigInt(m.info.tickSize);
+    // A buy may pay at most the cap (round down to the tick), a sell accepts at least it (round up).
+    const cap = side === "long" ? alignPrice(raw, m.info) : tick > 0n ? ((raw + tick - 1n) / tick) * tick : raw;
+    return side === "long" ? (p < cap ? p : cap) : (p > cap ? p : cap);
+  }
+
+  /** What became of a transaction this key may have posted: mined, still pending, or neither (dropped / never posted). */
+  async txState(operator: `0x${string}`, hash?: `0x${string}`): Promise<"mined" | "pending" | "none"> {
+    if (hash) {
+      const rc = await this.pub.getTransactionReceipt({ hash }).catch(() => undefined);
+      if (rc) return "mined";
+    }
+    const [pending, latest] = await Promise.all([
+      this.pub.getTransactionCount({ address: operator, blockTag: "pending" }),
+      this.pub.getTransactionCount({ address: operator, blockTag: "latest" }),
+    ]);
+    return pending > latest ? "pending" : "none";
+  }
+
   private async send(tk: TradingKey, m: PerpMarket, side: Side, price: bigint, quantity: bigint) {
+    const op = tk.operator.toLowerCase();
     try {
-      return await this.sendLock.run(tk.operator.toLowerCase(), () =>
-        placeFor(tk, { pool: m.info.poolAddress, isBid: side === "long", price, quantity, orderType: ORDER_TYPE.MARKET }));
+      // One send at a time per trading key from the nonce read to the post; the receipt wait runs outside the lock.
+      return await placeFor(tk, { pool: m.info.poolAddress, isBid: side === "long", price, quantity, orderType: ORDER_TYPE.MARKET },
+        (f) => this.sendLock.run(op, f));
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       const ts = new Date().toISOString();
       const phase = e instanceof SendError ? e.phase : "after-receipt";
-      if (phase === "reverted") throw new UserError(`The order reverted on chain: tx ${(e as SendError).hash}`);
+      const hash = e instanceof SendError ? e.hash : undefined;
+      if (phase === "reverted") throw new UserError(`The order reverted on chain: tx ${hash}`);
+      if (phase === "prepare") {
+        // The nonce/fee reads or the signing failed: nothing was signed and posted.
+        if (/insufficient funds|exceeds the balance/i.test(msg)) throw new UserError("Your bot key has no STT for gas. Send it some STT (see /key). Nothing was sent.");
+        console.log(ts, "order not sent (prepare):", msg.split("\n")[0]!.slice(0, 200));
+        throw new UserError("I could not reach the chain to prepare the order. Nothing was sent; try again in a moment.");
+      }
       if (phase === "send") {
         // The node refused the raw transaction for gas money: it never entered the chain.
         if (/insufficient funds|exceeds the balance/i.test(msg)) throw new UserError("Your bot key has no STT for gas. Send it some STT (see /key). Nothing was sent.");
         console.log(ts, "order outcome unknown (send):", msg.split("\n")[0]!.slice(0, 200));
-        throw new OutcomeUnknown("I could not confirm that the order reached the chain. Check /positions before you try again; I will not resend it.");
+        throw new OutcomeUnknown(`I could not confirm that the order reached the chain${hash ? ` (tx ${hash})` : ""}. Check /positions before you try again; I will not resend it.`, hash);
       }
-      if (phase === "wait" || phase === "after-receipt") {
-        // Posted (wait) or even mined (a decode failure after the receipt): the order may have filled.
-        const hash = e instanceof SendError ? e.hash : undefined;
+      if (phase === "wait" || phase === "decode" || phase === "after-receipt") {
+        // Posted (wait) or even mined (decode): the order may have filled.
         console.log(ts, `order outcome unknown (${phase}):`, msg.split("\n")[0]!.slice(0, 200));
         throw new OutcomeUnknown(`The order was sent${hash ? ` (tx ${hash})` : ""} but its result is not confirmed yet. Check /positions; I will not resend it.`, hash);
       }
@@ -208,8 +240,8 @@ export class Venue {
       if (msg.includes("ImmediateOrCancelNoFill")) throw new UserError("The book moved and nothing would fill. Nothing was sent; try again.");
       if (msg.includes("OnlyApprovedContracts") || msg.includes("NotAuthorized") || msg.includes("Unauthorized")) throw new UserError(`Your bot key is not linked for ${m.display}. Open the app, Link a bot, paste your bot address again.`);
       if (/insufficient funds|exceeds the balance/i.test(msg)) throw new UserError("Your bot key has no STT for gas. Send it some STT (see /key).");
-      const hash = /tx (0x[0-9a-fA-F]{64})/.exec(msg)?.[1];
-      if (hash) throw new UserError(`The order reverted on chain: tx ${hash}`);
+      const revHash = /tx (0x[0-9a-fA-F]{64})/.exec(msg)?.[1];
+      if (revHash) throw new UserError(`The order reverted on chain: tx ${revHash}`);
       console.log(ts, "order rejected:", msg.split("\n").filter((l) => /Error|reason|revert/i.test(l)).join(" | ").slice(0, 300));
       const named = /reverted with the following reason:\s*([^\n]{1,120})|Error: ([A-Za-z0-9_]+)\(/.exec(msg);
       throw new UserError(`The venue rejected the order${named ? `: ${(named[1] ?? named[2])!.trim()}` : ""}. Nothing was sent.`);
@@ -225,7 +257,7 @@ export class Venue {
   }
 
   /** Market (IOC) order for `notional` USDso. */
-  /** `opts.maxTouchPct`: refuse when the best price is further than this from the mark (card copies use 0.5 %). */
+  /** `opts.maxTouchPct`: refuse when the best price is further than this from the mark, and never fill further (card copies use 0.5 %). */
   async open(tk: TradingKey, base: string, side: Side, notional: number, opts: { maxTouchPct?: number } = {}): Promise<TradeResult> {
     const m = this.market(base);
     if (!m) throw new UserError(`Unknown market ${base}.`);
@@ -237,7 +269,7 @@ export class Venue {
       const min = Number(formatUnits(BigInt(m.info.minQuantity), m.info.baseDecimals));
       throw new UserError(`Too small: the minimum on ${m.display} is ${min} ${base} (about ${(min * mark).toFixed(2)} USDso notional).`);
     }
-    const price = this.slipPrice(m, side, touch);
+    const price = this.limitPrice(m, side, touch, mark, opts.maxTouchPct);
     const sized = await sizeOrder(this.exchange, { market: m, account: tk.owner, side, price, wanted, tradingKey: tk });
     if (!sized.ok) throw new UserError(`Cannot open: ${sized.reason ?? "the venue refused the size"}. If your Perps balance is empty, move USDso Spot -> Perps in the app.`);
     if (sized.quantity * 10n < wanted * 9n) {

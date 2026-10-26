@@ -27,7 +27,9 @@ import {
 import {
   createPublicClient,
   createWalletClient,
+  encodeFunctionData,
   http,
+  keccak256,
   parseAbi,
   type Chain,
   type PrivateKeyAccount,
@@ -75,6 +77,11 @@ export interface TradingKey {
   account: PrivateKeyAccount;
   publicClient: PublicClient;
   walletClient: WalletClient;
+  /**
+   * The nonce after this key's last transaction that a node accepted (kept by `send()`). The node's pending
+   * count wins when it is higher; cleared when a post or a receipt wait fails, so the node decides again.
+   */
+  nextNonce?: number;
 }
 
 export function createTradingKey(opts: {
@@ -90,14 +97,15 @@ export function createTradingKey(opts: {
         "or set it to the DreamDEX account this bot key is linked to.",
     );
   }
-  // Reads keep viem's default retries. Writes get none: a retried eth_sendRawTransaction could post the
-  // same signed order twice and then report the duplicate's error for a tx that went through.
+  // Both clients keep viem's default retries for reads (chain id, nonce, fees, simulation, receipts). The
+  // signed transaction itself is posted by `send()` with `sendRawTransaction`, which viem never retries
+  // (`retryCount: 0` per request), so one signed order is posted at most once.
   return {
     owner: opts.owner,
     operator: account.address,
     account,
     publicClient: createPublicClient({ chain: opts.chain, transport: http(opts.rpcUrl) }) as PublicClient,
-    walletClient: createWalletClient({ account, chain: opts.chain, transport: http(opts.rpcUrl, { retryCount: 0 }) }),
+    walletClient: createWalletClient({ account, chain: opts.chain, transport: http(opts.rpcUrl) }),
   };
 }
 
@@ -140,15 +148,17 @@ export function linkProblem(key: TradingKey, status: LinkStatus, market: string)
   );
 }
 
-/** Where a write failed. Only "simulate" means nothing reached the chain. */
-export type SendPhase = "simulate" | "send" | "wait" | "reverted";
+/** Where a write failed. "simulate" and "prepare" mean nothing was posted. */
+export type SendPhase = "simulate" | "prepare" | "send" | "wait" | "reverted" | "decode";
 
 /**
  * A failed write, labelled with the step that failed:
  * - "simulate": the eth_call said it would revert; nothing was sent;
- * - "send": signing or posting the raw transaction failed; it may or may not have reached the chain;
+ * - "prepare": reading the nonce, fees or chain id, or signing, failed; nothing was posted;
+ * - "send": posting the signed transaction failed; it may or may not have reached the chain (`hash` is known);
  * - "wait": the transaction was posted (`hash`) but its receipt did not arrive in time;
- * - "reverted": the receipt arrived with status reverted (`hash`).
+ * - "reverted": the receipt arrived with status reverted (`hash`);
+ * - "decode": the transaction succeeded (`hash`) but its events could not be decoded.
  */
 export class SendError extends Error {
   constructor(
@@ -165,36 +175,68 @@ export class SendError extends Error {
 const RECEIPT_TIMEOUT_MS = 60_000;
 const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
-/** Send a write the way the SDK does: simulate first, so a revert arrives as its named error, then send and wait. */
+/** Serialises, per key, the part of a send that picks the nonce and posts; the receipt wait runs outside it. */
+export type PostLock = <T>(f: () => Promise<T>) => Promise<T>;
+const noLock: PostLock = (f) => f();
+
+/**
+ * Send a write the way the SDK does: simulate first, so a revert arrives as its named error. Then pick the
+ * nonce, sign locally and hash the signed bytes BEFORE posting, so every outcome after the post carries the
+ * transaction hash. `lock` covers simulate -> post only; waiting for the receipt does not hold it.
+ */
 async function send(
   key: TradingKey,
   pool: `0x${string}`,
   functionName: "placeOrderFor" | "cancelOrderFor" | "reduceOrderFor",
   args: readonly unknown[],
+  lock: PostLock = noLock,
 ) {
-  let request: unknown;
-  try {
-    ({ request } = await key.publicClient.simulateContract({
-      address: pool,
-      abi: OPERATOR_ABI,
-      functionName,
-      args: args as never,
-      account: key.account,
-      gas: ORDER_GAS,
-    }));
-  } catch (e) {
-    throw new SendError("simulate", errText(e), undefined, { cause: e });
-  }
-  let hash: `0x${string}`;
-  try {
-    hash = await key.walletClient.writeContract(request as never);
-  } catch (e) {
-    throw new SendError("send", errText(e), undefined, { cause: e });
-  }
+  const hash = await lock(async () => {
+    try {
+      await key.publicClient.simulateContract({
+        address: pool,
+        abi: OPERATOR_ABI,
+        functionName,
+        args: args as never,
+        account: key.account,
+        gas: ORDER_GAS,
+      });
+    } catch (e) {
+      throw new SendError("simulate", errText(e), undefined, { cause: e });
+    }
+    let serialized: `0x${string}`;
+    let nonce: number;
+    try {
+      const pending = await key.publicClient.getTransactionCount({ address: key.operator, blockTag: "pending" });
+      nonce = key.nextNonce !== undefined && key.nextNonce > pending ? key.nextNonce : pending;
+      const request = await key.walletClient.prepareTransactionRequest({
+        account: key.account,
+        chain: key.walletClient.chain,
+        to: pool,
+        data: encodeFunctionData({ abi: OPERATOR_ABI, functionName, args: args as never }),
+        gas: ORDER_GAS,
+        nonce,
+      } as never);
+      // signTransaction also checks that the RPC's chain id is the configured chain's.
+      serialized = (await key.walletClient.signTransaction({ ...(request as object), account: key.account, chain: key.walletClient.chain } as never)) as `0x${string}`;
+    } catch (e) {
+      throw new SendError("prepare", errText(e), undefined, { cause: e });
+    }
+    const h = keccak256(serialized);
+    try {
+      await key.walletClient.sendRawTransaction({ serializedTransaction: serialized });
+    } catch (e) {
+      key.nextNonce = undefined;
+      throw new SendError("send", errText(e), h, { cause: e });
+    }
+    key.nextNonce = nonce + 1;
+    return h;
+  });
   let receipt: Awaited<ReturnType<PublicClient["waitForTransactionReceipt"]>>;
   try {
     receipt = await key.publicClient.waitForTransactionReceipt({ hash, timeout: RECEIPT_TIMEOUT_MS });
   } catch (e) {
+    key.nextNonce = undefined;
     throw new SendError("wait", errText(e), hash, { cause: e });
   }
   if (receipt.status !== "success") {
@@ -213,6 +255,7 @@ export interface OperatorPlacement {
 export async function placeFor(
   key: TradingKey,
   p: { pool: `0x${string}`; isBid: boolean; price: bigint; quantity: bigint; orderType: number },
+  lock?: PostLock,
 ): Promise<OperatorPlacement> {
   const { hash, receipt } = await send(key, p.pool, "placeOrderFor", [
     key.owner,
@@ -225,9 +268,13 @@ export async function placeFor(
     0,
     ZERO_ADDRESS,
     0n,
-  ]);
-  const { orderId, fills } = decodePlaceOrder(receipt, p.pool);
-  return { hash, orderId, fills };
+  ], lock);
+  try {
+    const { orderId, fills } = decodePlaceOrder(receipt, p.pool);
+    return { hash, orderId, fills };
+  } catch (e) {
+    throw new SendError("decode", errText(e), hash, { cause: e });
+  }
 }
 
 /** `cancelOrderFor`: the order's collateral goes back to the owner, never to the key. */

@@ -1,12 +1,12 @@
 // Perps Copilot: Telegram front end. Long polling, per-user serial queues, per-user rate limits,
 // one global cap on concurrent transactions. User text is parsed by src/parse.ts only; nothing
 // user-supplied reaches a shell, an eval, a file path or an SVG without validation.
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { getAddress } from "viem";
 import { APP_URL, CHAIN_NAME, DEMO_ACCOUNT, EXPLORER_ADDR, EXPLORER_TX, LIMITS, PATHS } from "./config.ts";
 import { renderCard } from "./card.ts";
 import { acquireInstanceLock } from "./instance.ts";
-import { KeyVault } from "./keys.ts";
+import { KeyVault, type SealedKey } from "./keys.ts";
 import { KeyedLock, Semaphore } from "./locks.ts";
 import { checkVsMark, cleanBase, escapeHtml as h, fmtPrice, fmtUsd, isAddress, liqDistancePct, parseAmount, parseLevel, parseOpen, resolveLevel, splitCommand, type OpenCmd, type Side } from "./parse.ts";
 import { Protector } from "./protect.ts";
@@ -36,6 +36,13 @@ class Bucket {
 /** A card-copy preview waiting for its Confirm button. In memory only; each one can be used once. */
 interface Draft { uid: number; owner: string; card: string; base: string; side: Side; margin: number; lev: number; exp: number }
 
+/** A user with a bot key (watch-only records have none until /start). */
+type KeyedUser = User & { keyAddress: `0x${string}`; key: SealedKey };
+const hasKey = (u: User): u is KeyedUser => !!u.key && !!u.keyAddress;
+/** 10 hex of a hash of the account: binds a button to the account it was shown for (vanity prefixes do not collide). */
+const acctTag = (owner: string) => createHash("sha256").update(owner.toLowerCase()).digest("hex").slice(0, 10);
+const closeData = (owner: string, base: string, pct: 50 | 100) => `cl:${base}:${pct}:${acctTag(owner)}`;
+
 const txLink = (hash: string) => `<a href="${EXPLORER_TX}${hash}">${hash.slice(0, 10)}…${hash.slice(-6)}</a>`;
 const addrLink = (a: string) => `<a href="${EXPLORER_ADDR}${a}">${a.slice(0, 8)}…${a.slice(-6)}</a>`;
 const BLOCKED_RE = /blocked by the user|user is deactivated|chat not found/i;
@@ -51,7 +58,9 @@ export class Bot {
   private txs = new Semaphore(LIMITS.maxConcurrentTx, () => new UserError("The bot is busy right now. Try again in a minute."));
   private autoTxs = new Semaphore(2, () => new UserError("The bot is busy right now. Try again in a minute.")); // auto-closes never queue behind other users' opens
   private posLock = new KeyedLock();
-  private recentClose = new Map<string, { prevSize: number; at: number }>();
+  private recentClose = new Map<string, { prevSize: number; at: number; unknown: boolean }>();
+  /** `${owner}:${base}` -> an order whose outcome was not confirmed: no new send there until the chain says it is done. */
+  private unresolved = new Map<string, { hash?: `0x${string}`; operator: `0x${string}`; at: number }>();
   private pending = new Map<number, number>();
   private queues = new Map<number, Promise<void>>();
   private drafts = new Map<string, Draft>();
@@ -60,6 +69,7 @@ export class Bot {
   private demoCache?: { account: string; at: number; view: AccountView; orders: OrderRow[]; totals: ReturnType<Store["orderTotals"]> };
   private releaseLock?: () => void;
   private stopping = false;
+  private stopAt = 0;
 
   constructor() {
     const bot = readEnvFile(PATHS.botEnv);
@@ -83,7 +93,8 @@ export class Bot {
       process.exit(3);
     }
     log("instance lock acquired");
-    const stop = () => { this.stopping = true; this.protector.stop(); this.releaseLock?.(); };
+    // The lock is kept until in-flight orders are done (shutdown()), so no second instance sends from the same keys meanwhile.
+    const stop = () => this.requestStop();
     process.on("SIGTERM", stop);
     process.on("SIGINT", stop);
     await this.venue.init();
@@ -113,19 +124,58 @@ export class Bot {
       "dreamDEX perps from Telegram: orders, TP/SL, liquidation alerts, copyable PnL cards. Testnet.",
     ).catch((e) => log("setDescription", String(e)));
     this.protector.start();
-    setInterval(() => {
-      this.buckets.prune(3_600_000);
-      for (const [k, v] of this.recentClose) if (Date.now() - v.at > 60_000) this.recentClose.delete(k);
-      for (const [k, d] of this.drafts) if (d.exp <= Date.now()) this.drafts.delete(k);
-      const n = this.store.pruneUnlinked(48 * 3_600_000);
-      if (n) log("pruned unlinked users", n);
-      const c = this.store.pruneCards();
-      if (c) log("pruned old cards", c);
-    }, 10 * 60_000).unref();
+    setInterval(() => void this.housekeeping().catch((e) => log("housekeeping error", String(e).slice(0, 160))), 10 * 60_000).unref();
     await this.poll();
+    await this.shutdown();
+    log("stopped");
+  }
+
+  /** SIGTERM / SIGINT: stop polling and stop starting new trades or auto-closes; work already running finishes. */
+  private requestStop(): void {
+    if (this.stopping) return;
+    this.stopping = true;
+    this.stopAt = Date.now();
+    this.protector.stop();
+    log("stopping: finishing in-flight work");
+  }
+
+  /** Wait (bounded, under systemd's 90 s stop timeout) for queued handlers and running auto-closes, then release the lock. */
+  private async shutdown(): Promise<void> {
+    const deadline = (this.stopAt || Date.now()) + LIMITS.shutdownDrainMs;
+    // No new work can start (polling and the Protector are stopped), so one pass over what is queued or running drains it.
+    const drained = (async () => {
+      do { await Promise.allSettled([...this.queues.values(), this.protector.idle()]); } while (this.queues.size);
+    })();
+    let timer: NodeJS.Timeout | undefined;
+    const timedOut = new Promise<boolean>((r) => { timer = setTimeout(() => r(false), Math.max(0, deadline - Date.now())); });
+    const done = await Promise.race([drained.then(() => true), timedOut]);
+    clearTimeout(timer);
+    if (!done) log("shutdown: work still running at the deadline, exiting anyway");
     this.protector.stop();
     this.releaseLock?.();
-    log("stopped");
+  }
+
+  private notStopping(): void {
+    if (this.stopping) throw new UserError("The bot is restarting. Nothing was sent; send it again in a minute.");
+  }
+
+  /** Every 10 minutes: expire rate-limit buckets, drafts and markers; end idle watches (and say so); prune records and cards. */
+  private async housekeeping(): Promise<void> {
+    const now = Date.now();
+    this.buckets.prune(3_600_000);
+    for (const [k, v] of this.recentClose) if (now - v.at > 60_000) this.recentClose.delete(k);
+    for (const [k, d] of this.drafts) if (d.exp <= now) this.drafts.delete(k);
+    for (const [k, v] of this.unresolved) if (now - v.at > LIMITS.unresolvedTtlMs) this.unresolved.delete(k);
+    const ended = this.store.expireWatches(LIMITS.watchIdleMs, now);
+    for (const { user, addrs } of ended) {
+      if (user.blockedAt) continue;
+      await this.say(user.id, `I stopped watching ${addrs.map((a) => addrLink(getAddress(a))).join(", ")}: ${Math.round(LIMITS.watchIdleMs / 86_400_000)} days without a message from you. Send <code>/watch 0x…</code> to watch again.`);
+    }
+    if (ended.length) { log("ended idle watches", ended.length); await this.protector.refreshWatched().catch(() => {}); }
+    const n = this.store.pruneUnlinked(48 * 3_600_000, now);
+    if (n) log("pruned unlinked users", n);
+    const c = this.store.pruneCards(now);
+    if (c) log("pruned old cards", c);
   }
 
   private async poll(): Promise<void> {
@@ -173,6 +223,9 @@ export class Bot {
   }
 
   private async handle(u: TgUpdate): Promise<void> {
+    const from = u.message?.from ?? u.callback_query?.from;
+    const known = from ? this.store.get(from.id) : undefined;
+    if (known) { const prev = known.lastSeen ?? 0; known.lastSeen = Date.now(); if (known.lastSeen - prev > 3_600_000) this.store.save(); }
     if (u.callback_query) return this.onCallback(u.callback_query);
     const m = u.message!;
     const chat = m.chat.id;
@@ -196,18 +249,24 @@ export class Bot {
     if (cmd === "markets") return this.cmdMarkets(chat);
     if (cmd === "demo") return this.cmdDemo(id, chat);
     if (cmd === "watch" || cmd === "unwatch") {
-      // No link needed: watching only reads public chain state. A record is made for the watch list.
+      // No link and no key needed: watching only reads public chain state. A keyless record holds the watch
+      // list, made only for a valid /watch request.
       const existing = this.store.get(id);
-      if (!existing && !args[0]) {
-        await this.say(chat, cmd === "watch" ? this.watchUsage(LIMITS.defaultLiqWarnPct) : "You watch no accounts.");
-        return;
+      if (!existing) {
+        if (cmd === "unwatch" || !args[0]) { await this.say(chat, cmd === "watch" ? this.watchUsage(LIMITS.defaultLiqWarnPct) : "You watch no accounts."); return; }
+        const bad = this.watchAddrProblem(args[0], LIMITS.defaultLiqWarnPct);
+        if (bad) { await this.say(chat, bad); return; }
       }
-      const r = existing ? { user: existing } : await this.ensureUser(id, chat);
+      const r = existing ? { user: existing } : await this.ensureUser(id, chat, { key: false });
       if (!r) return;
       return cmd === "watch" ? this.cmdWatch(r.user, chat, args[0]) : this.cmdUnwatch(r.user, chat, args[0]);
     }
     const user = this.store.get(id);
-    if (!user) { await this.say(chat, "Send /start first to get your personal bot key, or /demo to look around."); return; }
+    if (!user || !hasKey(user)) {
+      if (user && cmd === "alerts") return this.cmdAlerts(user, chat, args[0]); // watchers set their warning distance too
+      await this.say(chat, "Send /start first to get your personal bot key, or /demo to look around.");
+      return;
+    }
     switch (cmd) {
       case "key": return this.cmdKey(user, chat);
       case "link": return this.cmdLink(user, chat, args[0]);
@@ -238,30 +297,66 @@ export class Bot {
   }
 
   // ---------- onboarding ----------
-  /** Create the user record (and their bot key) if it does not exist yet, within the sign-up caps. */
-  private async ensureUser(id: number, chat: number, refBy?: string, via = "direct"): Promise<{ user: User; created: boolean } | undefined> {
+  /**
+   * Create the user record if it does not exist yet, within the sign-up caps. With `key` (the default) the
+   * user also gets their bot key (a watch-only record gets one here when it first needs it); `key: false`
+   * makes a keyless watch-only record, capped separately and never counted against the key quota.
+   */
+  private async ensureUser(id: number, chat: number, o: { refBy?: string; via?: string; key?: boolean } = {}): Promise<{ user: User; created: boolean } | undefined> {
+    const wantKey = o.key !== false;
     const existing = this.store.get(id);
-    if (existing) return { user: existing, created: false };
-    if (this.store.count() >= LIMITS.maxUsers) { await this.say(chat, "The testnet beta is full right now. Please try again later."); return undefined; }
-    if (this.store.keysMadeLastHour() >= LIMITS.newKeysPerHour) { await this.say(chat, "Lots of sign-ups this hour. Please try again in a few minutes."); return undefined; }
-    const { address, sealed } = this.vault.create(id);
-    const user = this.store.add({ id, created: Date.now(), keyAddress: address, key: sealed, refBy });
-    log("new user", refBy ? via : "direct", "total", this.store.count());
+    if (existing) {
+      if (wantKey && !hasKey(existing) && !(await this.giveKey(existing, chat))) return undefined;
+      return { user: existing, created: false };
+    }
+    let user: User;
+    if (wantKey) {
+      if (!(await this.keyAllowed(chat))) return undefined;
+      const { address, sealed } = this.vault.create(id);
+      user = this.store.add({ id, created: Date.now(), keyAddress: address, key: sealed, refBy: o.refBy });
+    } else {
+      if (this.store.count() - this.store.countKeyed() >= LIMITS.watchUsersMax) { await this.say(chat, "Watch mode is full right now. Please try again later."); return undefined; }
+      user = this.store.add({ id, created: Date.now(), refBy: o.refBy });
+    }
+    log(wantKey ? "new user" : "new watcher", o.refBy ? o.via ?? "via link" : "direct", "total", this.store.count());
     return { user, created: true };
   }
 
+  private async keyAllowed(chat: number): Promise<boolean> {
+    if (this.store.countKeyed() >= LIMITS.maxUsers) { await this.say(chat, "The testnet beta is full right now. Please try again later."); return false; }
+    if (this.store.keysMadeLastHour() >= LIMITS.newKeysPerHour) { await this.say(chat, "Lots of sign-ups this hour. Please try again in a few minutes."); return false; }
+    return true;
+  }
+
+  /** A watch-only record gets its bot key (within the same caps as a new user). */
+  private async giveKey(u: User, chat: number): Promise<boolean> {
+    if (hasKey(u)) return true;
+    if (!(await this.keyAllowed(chat))) return false;
+    const { address, sealed } = this.vault.create(u.id);
+    this.store.setKey(u, address, sealed);
+    log("watcher got a key", "total keyed", this.store.countKeyed());
+    return true;
+  }
+
   private async cmdStart(id: number, chat: number, payload?: string): Promise<void> {
-    const card = payload && /^c_[0-9a-f]{10}$/.test(payload) ? this.store.card(payload.slice(2)) : undefined;
+    const cardId = payload && /^c_[0-9a-f]{10}$/.test(payload) ? payload.slice(2) : undefined;
+    const card = cardId ? this.store.card(cardId) : undefined;
     let refBy: string | undefined;
     if (card) {
       const sharer = this.store.get(card.by);
       if (sharer && sharer.id !== id) refBy = sharer.ref;
+    } else if (cardId) {
+      // An expired or pruned card: no trade to show, but the sharer still gets the credit.
+      const ref = this.store.cardRef(cardId);
+      const sharer = ref ? this.store.byRef(ref) : undefined;
+      if (sharer && sharer.id !== id) refBy = ref;
     } else if (payload && /^r_[0-9a-f]{10}$/.test(payload) && this.store.byRef(payload.slice(2))) {
       refBy = payload.slice(2);
     }
-    const r = await this.ensureUser(id, chat, refBy, card ? "via card" : "via share link");
-    if (!r) return;
+    const r = await this.ensureUser(id, chat, { refBy, via: cardId ? "via card" : "via share link" });
+    if (!r || !hasKey(r.user)) return;
     const user = r.user;
+    if (cardId && !card) await this.say(chat, "That shared trade has expired (shared cards last 30 days). Here is how to start:");
     if (card) {
       if (card.by !== id) { // the sharer's own taps change no counters and send no ping
         const tapKey = `${card.id}:${id}`;
@@ -272,7 +367,7 @@ export class Bot {
         }
         if (r.created) card.newUsers++;
         this.store.save();
-        if (r.created) await this.pingSharer(card, `🎉 Your ${card.base} card brought a new trader to Perps Copilot.`);
+        if (r.created) await this.pingSharer(card, `🎉 Your ${card.base} card brought a new user to Perps Copilot.`);
       }
       if (user.owner) { await this.cardLanding(user, chat, card); return; }
       user.pendingCopy = { card: card.id, at: Date.now() };
@@ -310,12 +405,12 @@ export class Bot {
       `Testnet only (${CHAIN_NAME}). Not financial advice.`);
   }
 
-  private async cmdKey(u: User, chat: number): Promise<void> {
+  private async cmdKey(u: KeyedUser, chat: number): Promise<void> {
     const gas = await this.venue.gasBalance(u.keyAddress);
     await this.say(chat, `Your bot key: <code>${u.keyAddress}</code>\nGas: ${gas.toFixed(4)} STT${gas < LIMITS.lowGasStt ? " (low: each order costs about 0.015 STT; top it up from the app's Link a bot screen or send STT to the address)" : ""}\n${addrLink(u.keyAddress)}`);
   }
 
-  private async cmdLink(u: User, chat: number, arg?: string): Promise<void> {
+  private async cmdLink(u: KeyedUser, chat: number, arg?: string): Promise<void> {
     if (!isAddress(arg)) { await this.say(chat, "Send <code>/link 0xYourDreamdexAccount</code>, or link the bot key in the app and press <b>I've linked it</b> after /start."); return; }
     if (!this.linkCheckAllowed(u.id)) { await this.say(chat, "Please wait a minute before linking again."); return; }
     await this.attach(u, chat, getAddress(arg));
@@ -325,7 +420,7 @@ export class Bot {
     return this.buckets.allow(`link:${id}`, 3, 60_000) && this.buckets.allow(`linkh:${id}`, 15, 3_600_000);
   }
 
-  private async attach(u: User, chat: number, owner: `0x${string}`): Promise<void> {
+  private async attach(u: KeyedUser, chat: number, owner: `0x${string}`): Promise<void> {
     if (owner.toLowerCase() === u.keyAddress.toLowerCase()) { await this.say(chat, "That is the bot key itself. Send the dreamDEX account you linked it to."); return; }
     const cov = await this.venue.coverage(owner, u.keyAddress);
     if (!cov.linked.length) {
@@ -335,6 +430,7 @@ export class Bot {
     if (u.owner && u.owner.toLowerCase() !== owner.toLowerCase()) {
       // A TP/SL, an open record or a pending copy set on the old account must never act on the new one.
       u.rules = {}; u.opens = {}; delete u.lastClosed; delete u.pendingCopy;
+      this.protector.dropUser(u.id); // synchronously, before the owner changes: no push may see the old positions under the new owner
       log("relink: cleared per-account state");
     }
     u.owner = owner; this.venue.forgetKey(u.id); this.store.save();
@@ -356,6 +452,7 @@ export class Bot {
   }
 
   private async cmdUnlink(u: User, chat: number): Promise<void> {
+    this.protector.dropUser(u.id);
     delete u.owner; u.rules = {}; u.opens = {}; delete u.lastClosed; delete u.pendingCopy;
     this.venue.forgetKey(u.id); this.store.save();
     await this.protector.refreshUser(u).catch(() => {});
@@ -374,7 +471,7 @@ export class Bot {
     await this.say(chat, `<b>Perp markets</b> (${CHAIN_NAME}, quoted in USDso)\n<pre>${h(rows.join("\n"))}</pre>`);
   }
 
-  private async cmdStatus(u: User, chat: number): Promise<void> {
+  private async cmdStatus(u: KeyedUser, chat: number): Promise<void> {
     const gas = await this.venue.gasBalance(u.keyAddress);
     if (!u.owner) { await this.say(chat, `Not linked yet. Bot key <code>${u.keyAddress}</code> (gas ${gas.toFixed(3)} STT). Send /start for the steps.`); return; }
     const acct = await this.venue.account(u.owner);
@@ -433,7 +530,7 @@ export class Bot {
     let rec = du ? this.store.cardsBy(du.id)[0] : undefined;
     if (!rec && du?.lastClosed) {
       const c = du.lastClosed;
-      rec = this.store.addCard({ by: du.id, base: c.base, side: c.side, lev: du.opens[c.base]?.leverage, entry: c.entry, price: c.exit, pnl: c.pnl, open: false, at: Date.now(), tradeAt: c.at });
+      rec = this.store.upsertCard({ by: du.id, base: c.base, side: c.side, lev: c.lev ?? du.opens[c.base]?.leverage, entry: c.entry, price: c.exit, pnl: c.pnl, open: false, at: Date.now(), tradeAt: c.at });
       this.store.save();
     }
     if (!rec) { await this.say(chat, "No sample card yet."); return; }
@@ -448,7 +545,22 @@ export class Bot {
 
   private tk(u: User) {
     const { owner } = this.requireLinked(u);
+    if (!hasKey(u)) throw new UserError("Send /start first to get your personal bot key.");
     return this.venue.tradingKey(u.id, owner, () => this.vault.open(u.id, u.key));
+  }
+
+  /** An earlier order on this account+market whose outcome is unknown blocks new sends there until the chain settles it. */
+  private async checkUnresolved(tk: { owner: string }, base: string): Promise<void> {
+    const k = `${tk.owner.toLowerCase()}:${base}`;
+    const ur = this.unresolved.get(k);
+    if (!ur) return;
+    const st = await this.venue.txState(ur.operator, ur.hash).catch(() => "unknown" as const);
+    if (st === "mined" || st === "none") { this.unresolved.delete(k); return; } // the next read of the position shows the result
+    throw new UserError(`An earlier ${base}-PERP order${ur.hash ? ` (tx ${ur.hash.slice(0, 10)}…)` : ""} is still pending on chain, so its result is not confirmed yet. Nothing was sent; check /positions in a moment.`);
+  }
+
+  private markUnresolved(tk: { owner: string; operator: `0x${string}` }, base: string, hash?: `0x${string}`): void {
+    this.unresolved.set(`${tk.owner.toLowerCase()}:${base}`, { hash, operator: tk.operator, at: Date.now() });
   }
 
   private tradeAllowed(u: User): void {
@@ -458,6 +570,7 @@ export class Bot {
   }
 
   private async gasCheck(u: User): Promise<void> {
+    if (!u.keyAddress) throw new UserError("Send /start first to get your personal bot key.");
     const gas = await this.venue.gasBalance(u.keyAddress);
     if (gas < 0.02) throw new UserError(`Your bot key has ${gas.toFixed(4)} STT, not enough for gas. Send STT to ${u.keyAddress} (or use Top up on the app's Link a bot screen).`);
   }
@@ -483,7 +596,9 @@ export class Bot {
   }
 
   private async openLocked(u: User, chat: number, side: Side, p: OpenCmd, tk: ReturnType<Bot["tk"]>, opts: { maxTouchPct?: number; via?: "card"; card?: string } = {}): Promise<TradeResult | undefined> {
+    this.notStopping();
     const m = this.venue.market(p.base)!;
+    await this.checkUnresolved(tk, p.base);
     const [cap, acct] = await Promise.all([this.venue.accountCap(tk.owner, m), this.venue.account(tk.owner)]);
     if (cap > 0 && p.leverage > cap) throw new UserError(`Your account caps ${p.base}-PERP at ${cap}x (set in the app). Use ${cap}x or less, or raise it in the app.`);
     const existing = acct.positions.find((x) => x.base === p.base);
@@ -499,10 +614,13 @@ export class Bot {
       r = await this.txs.run(() => this.venue.open(tk, p.base, side, notional, { maxTouchPct: opts.maxTouchPct }));
     } catch (e) {
       // Maybe on chain: log it so evidence/ re-verifies it from the receipt. It is never resent.
-      if (e instanceof OutcomeUnknown) this.record(u, "unknown", { base: p.base, side, hash: e.hash }, undefined, { intent: "open", ...extra });
+      if (e instanceof OutcomeUnknown) {
+        this.markUnresolved(tk, p.base, e.hash);
+        this.record(u, tk.owner, "unknown", { base: p.base, side, hash: e.hash }, undefined, { intent: "open", ...extra });
+      }
       throw e;
     }
-    this.record(u, "open", r, undefined, extra);
+    this.record(u, tk.owner, "open", r, undefined, extra);
     if (r.filledBase === 0) { await this.say(chat, `Nothing filled (the book moved). Tx ${txLink(r.hash)}. No position was opened.`); return r; }
     u.opens[p.base] = existing ? { margin: (u.opens[p.base]?.margin ?? 0) + p.margin, leverage: p.leverage, at: Date.now() } : { margin: p.margin, leverage: p.leverage, at: Date.now() };
     const notes: string[] = [];
@@ -515,7 +633,12 @@ export class Bot {
       if (typeof v === "string") { notes.push(`${k.toUpperCase()} not set: ${v}`); continue; }
       const bad = markNow ? checkVsMark(k, side, v, markNow) : undefined;
       if (bad) { notes.push(`${k.toUpperCase()} not set: ${bad} Set it again with /${k} ${p.base}.`); continue; }
-      u.rules[p.base] = { ...(u.rules[p.base] ?? { side, setAt: Date.now() }), side, [k]: v };
+      const old = u.rules[p.base];
+      if (k === "sl" && opts.via === "card" && old?.sl !== undefined && old.side === side && (side === "long" ? old.sl > v : old.sl < v)) {
+        notes.push(`SL kept at ${fmtPrice(old.sl)} (tighter than 3% from this fill)`); // a copy's preset stop never loosens the user's own
+        continue;
+      }
+      u.rules[p.base] = { ...(old ?? { side, setAt: Date.now() }), side, [k]: v };
       notes.push(`${k.toUpperCase()} ${fmtPrice(v)} watched`);
     }
     this.store.save();
@@ -525,7 +648,7 @@ export class Bot {
       `<b>Filled</b> ${side} ${r.filledBase} ${p.base} @ ${r.avgPrice ? fmtPrice(r.avgPrice) : "?"}\nTx ${txLink(r.hash)}\n` +
       (pos ? `Position: ${pos.side} ${pos.size} ${p.base}, entry ${fmtPrice(pos.entry)}${pos.liq ? `, liquidation ${fmtPrice(pos.liq)}` : ""}\n` : "") +
       (notes.length ? h(notes.join(" · ")) + "\n" : `Add exits: <code>/tp ${p.base} 4%</code> <code>/sl ${p.base} 2%</code>\n`),
-      [[{ text: `Close ${p.base}`, callback_data: `cl:${p.base}:100` }, { text: "PnL card", callback_data: `cd:${p.base}` }]]);
+      [[{ text: `Close ${p.base}`, callback_data: closeData(tk.owner, p.base, 100) }, { text: "PnL card", callback_data: `cd:${p.base}` }]]);
     return r;
   }
 
@@ -541,10 +664,15 @@ export class Bot {
     await this.doClose(u, chat, base, fraction, "manual close");
   }
 
-  private async doClose(u: User, chat: number, base: string, fraction: number, reason: string, opt: { limit?: number; expectSide?: Side; auto?: boolean } = {}): Promise<TradeResult> {
+  private async doClose(u: User, chat: number, base: string, fraction: number, reason: string, opt: { limit?: number; expectSide?: Side; auto?: boolean; owner?: string } = {}): Promise<TradeResult> {
     const tk = this.tk(u);
+    if (opt.owner && tk.owner.toLowerCase() !== opt.owner.toLowerCase()) {
+      throw new UserError(`Your linked account changed, so the ${base}-PERP exit set on the old account was dropped. Nothing was sent.`);
+    }
     const key = `${tk.owner.toLowerCase()}:${base}`;
     return this.posLock.run(key, async () => {
+      if (!opt.auto) this.notStopping();
+      await this.checkUnresolved(tk, base);
       await this.gasCheck(u);
       let sideChanged = false;
       let read: { abs: number; side: Side } | undefined;
@@ -557,7 +685,9 @@ export class Bot {
         }
         const rc = this.recentClose.get(key);
         if (rc && Date.now() - rc.at < 20_000 && abs >= rc.prevSize - 1e-12) {
-          throw new UserError(`A close for ${base}-PERP just went through and the chain read has not caught up yet. Nothing was sent; check /positions in a few seconds.`);
+          throw new UserError(rc.unknown
+            ? `A close for ${base}-PERP may have gone through moments ago (not confirmed yet). Nothing was sent; check /positions in a few seconds.`
+            : `A close for ${base}-PERP just went through and the chain read has not caught up yet. Nothing was sent; check /positions in a few seconds.`);
         }
       };
       let r: TradeResult;
@@ -567,24 +697,27 @@ export class Bot {
         if (sideChanged) { delete u.rules[base]; this.store.save(); }
         if (e instanceof OutcomeUnknown) {
           // The close may have gone through: block re-tries on the same size for 20 s; the next try reads the chain afresh.
-          this.recentClose.set(key, { prevSize: read?.abs ?? 0, at: Date.now() });
+          this.recentClose.set(key, { prevSize: read?.abs ?? 0, at: Date.now(), unknown: true });
+          this.markUnresolved(tk, base, e.hash);
           const side: Side = read?.side === "short" ? "long" : "short";
-          this.record(u, "unknown", { base, side, hash: e.hash }, reason, { intent: "close" });
+          this.record(u, tk.owner, "unknown", { base, side, hash: e.hash }, reason, { intent: "close" });
         }
         throw e;
       }
-      if (r.filledBase > 0) this.recentClose.set(key, { prevSize: r.prevSize ?? Infinity, at: Date.now() });
+      if (r.filledBase > 0) this.recentClose.set(key, { prevSize: r.prevSize ?? Infinity, at: Date.now(), unknown: false });
       return this.afterClose(u, chat, base, reason, tk.owner, r);
     });
   }
 
   private async afterClose(u: User, chat: number, base: string, reason: string, owner: `0x${string}`, r: TradeResult): Promise<TradeResult> {
-    this.record(u, "close", r, reason);
+    this.record(u, owner, "close", r, reason);
     const left = await this.waitPosition(owner, base, (x) => r.filledBase === 0 || !x || x.size < (r.prevSize ?? Infinity) - 1e-12);
-    if (r.filledBase > 0 && r.avgPrice && r.entry) {
-      u.lastClosed = { base, side: r.side === "short" ? "long" : "short", entry: r.entry, exit: r.avgPrice, size: r.filledBase, pnl: r.realizedPnl ?? 0, at: Date.now(), reason };
+    // Relinked while this close was in flight: it was the old account's trade; the new account's records stay as they are.
+    const same = u.owner?.toLowerCase() === owner.toLowerCase();
+    if (same && r.filledBase > 0 && r.avgPrice && r.entry) {
+      u.lastClosed = { base, side: r.side === "short" ? "long" : "short", entry: r.entry, exit: r.avgPrice, size: r.filledBase, pnl: r.realizedPnl ?? 0, at: Date.now(), reason, lev: u.opens[base]?.leverage, full: !left };
     }
-    if (!left) { delete u.rules[base]; }
+    if (same && !left) { delete u.rules[base]; delete u.opens[base]; } // a later position (e.g. opened in the app) starts with no stale leverage
     this.store.save();
     await this.protector.refreshUser(u).catch(() => {});
     await this.say(chat,
@@ -592,14 +725,14 @@ export class Bot {
       `Tx ${txLink(r.hash)}\n` +
       (r.realizedPnl !== undefined && r.filledBase > 0 ? `Realised PnL ≈ ${fmtUsd(r.realizedPnl, true)} USDso (before fees)\n` : "") +
       (left ? `Remaining: ${left.side} ${left.size} ${base}` : "Position closed."),
-      r.filledBase > 0 ? [[{ text: "PnL card", callback_data: `cd:${base}` }]] : undefined);
+      same && r.filledBase > 0 ? [[{ text: "PnL card", callback_data: `cd:${base}` }]] : undefined);
     return r;
   }
 
-  private async autoClose(u: User, base: string, fraction: number, reason: string, opt: { kind: "tp" | "sl" | "guard"; limit?: number; side: Side }): Promise<void> {
+  private async autoClose(u: User, base: string, fraction: number, reason: string, opt: { kind: "tp" | "sl" | "guard"; limit?: number; side: Side; owner?: string }): Promise<void> {
     log("auto-close", base, opt.kind, reason);
     try {
-      await this.doClose(u, u.id, base, fraction, reason, { limit: opt.limit, expectSide: opt.side, auto: true });
+      await this.doClose(u, u.id, base, fraction, reason, { limit: opt.limit, expectSide: opt.side, auto: true, owner: opt.owner });
     } catch (e) {
       const msg = e instanceof UserError ? e.message : "chain error";
       log("auto-close failed", base, opt.kind, String(e instanceof Error ? e.message : e).slice(0, 200));
@@ -620,13 +753,14 @@ export class Bot {
   }
 
   private async liqWarn(u: User, base: string, text: string): Promise<void> {
-    await this.say(u.id, `⚠️ <b>Liquidation risk</b>\n${h(text)}`, [[{ text: "Close 50%", callback_data: `cl:${base}:50` }, { text: "Close all", callback_data: `cl:${base}:100` }]]);
+    if (!u.owner) return;
+    await this.say(u.id, `⚠️ <b>Liquidation risk</b>\n${h(text)}`, [[{ text: "Close 50%", callback_data: closeData(u.owner, base, 50) }, { text: "Close all", callback_data: closeData(u.owner, base, 100) }]]);
   }
 
-  /** Order log row: public on-chain facts plus public extras (`via`, `card`, `intent`). No Telegram ids. */
-  private record(u: User, kind: string, r: Partial<TradeResult> & { base: string; side: Side }, reason?: string, extra?: Record<string, string | undefined>): void {
+  /** Order log row: public on-chain facts plus public extras (`via`, `card`, `intent`). No Telegram ids. `account`: the account the order was sent for. */
+  private record(u: User, account: string, kind: string, r: Partial<TradeResult> & { base: string; side: Side }, reason?: string, extra?: Record<string, string | undefined>): void {
     u.stats.orders++;
-    this.store.logOrder({ kind, reason, market: `${r.base}-PERP`, side: r.side, hash: r.hash, filled: r.filledBase, requested: r.requestedBase, avgPrice: r.avgPrice === undefined ? undefined : Number(r.avgPrice.toPrecision(10)), key: u.keyAddress, account: u.owner, ...extra });
+    this.store.logOrder({ kind, reason, market: `${r.base}-PERP`, side: r.side, hash: r.hash, filled: r.filledBase, requested: r.requestedBase, avgPrice: r.avgPrice === undefined ? undefined : Number(r.avgPrice.toPrecision(10)), key: u.keyAddress, account, ...extra });
   }
 
   private async cmdPositions(u: User, chat: number): Promise<void> {
@@ -643,7 +777,7 @@ export class Bot {
         `liquidation ${p.liq ? `${fmtPrice(p.liq)} (${d!.toFixed(1)}% away)` : p.side === "long" ? "none above 0 (your margin covers this long)" : "n/a"}` +
         (r ? `\nwatched: ${r.tp ? `TP ${fmtPrice(r.tp)} ` : ""}${r.sl ? `SL ${fmtPrice(r.sl)}` : ""}` : "");
     });
-    const buttons = acct.positions.slice(0, 6).map((p) => [{ text: `Close ${p.base}`, callback_data: `cl:${p.base}:100` }, { text: `Card ${p.base}`, callback_data: `cd:${p.base}` }]);
+    const buttons = acct.positions.slice(0, 6).map((p) => [{ text: `Close ${p.base}`, callback_data: closeData(owner, p.base, 100) }, { text: `Card ${p.base}`, callback_data: `cd:${p.base}` }]);
     await this.say(chat, `${lines.join("\n\n")}\n\nEquity ${fmtUsd(acct.equity)} USDso · margin status ${h(acct.status)}`, buttons);
   }
 
@@ -694,11 +828,12 @@ export class Bot {
     const acct = u.owner ? await this.venue.account(u.owner) : undefined;
     const p = acct?.positions.find((x) => !want || x.base === want);
     let rec: CardRec;
+    // The same trade keeps its card (refreshed), so a link that was already forwarded keeps working.
     if (p) {
-      rec = this.store.addCard({ by: u.id, base: p.base, side: p.side, lev: u.opens[p.base]?.leverage, entry: p.entry, price: p.mark, pnl: p.upnl, open: true, at: Date.now() });
+      rec = this.store.upsertCard({ by: u.id, base: p.base, side: p.side, lev: u.opens[p.base]?.leverage, entry: p.entry, price: p.mark, pnl: p.upnl, open: true, at: Date.now() });
     } else if (u.lastClosed && (!want || u.lastClosed.base === want)) {
       const c = u.lastClosed;
-      rec = this.store.addCard({ by: u.id, base: c.base, side: c.side, lev: u.opens[c.base]?.leverage, entry: c.entry, price: c.exit, pnl: c.pnl, open: false, at: Date.now(), tradeAt: c.at });
+      rec = this.store.upsertCard({ by: u.id, base: c.base, side: c.side, lev: c.lev ?? u.opens[c.base]?.leverage, entry: c.entry, price: c.exit, pnl: c.pnl, open: false, at: Date.now(), tradeAt: c.at });
     } else {
       await this.say(chat, "No position or recent close to put on a card yet.");
       return;
@@ -738,7 +873,8 @@ export class Bot {
     const m = this.venue.market(card.base);
     const mark = m ? await this.venue.mark(m).catch(() => undefined) : undefined;
     const sharer = this.store.get(card.by);
-    const closedSince = card.open && !!sharer?.lastClosed && sharer.lastClosed.base === card.base && sharer.lastClosed.at > card.at;
+    const lc = sharer?.lastClosed;
+    const closedSince = card.open && !!lc && lc.full !== false && lc.base === card.base && lc.at > card.at; // a partial close is not "closed"
     const lines = [
       own ? "<b>Your card: open it again</b>" : "<b>Shared trade</b>",
       `${card.base}-PERP ${card.side}${card.lev ? ` ${card.lev}x` : ""} · entry ${fmtPrice(card.entry)} → ${card.open ? "mark" : "exit"} ${fmtPrice(card.price)} · ${fmtUsd(card.pnl, true)} USDso`,
@@ -754,8 +890,8 @@ export class Bot {
       await this.say(chat, lines.join("\n"));
       return;
     }
-    const { lev } = this.copyLeverage(card);
-    lines.push("", `Copy it on your own account: pick a margin. Other size: <code>/${card.side} ${card.base} 20 ${lev}x</code>`);
+    // Only the margin buttons copy: they carry the copy limits and counts (a plain /long would not).
+    lines.push("", "Copy it on your own account (a one-time order): pick a margin.");
     await this.say(chat, lines.join("\n"), [LIMITS.cardMargins.map((v) => ({ text: `${v} USDso`, callback_data: `cm:${card.id}:${v}` }))]);
   }
 
@@ -769,21 +905,28 @@ export class Bot {
     const { lev, note } = this.copyLeverage(card);
     const notional = margin * lev;
     const minN = this.venue.minNotional(card.base);
-    if (minN && notional < minN * 1.02) throw new UserError(`Too small: the minimum ${card.base}-PERP order is about ${(minN * 1.02).toFixed(2)} USDso notional. Pick a larger size or send /${card.side} ${card.base} <margin> ${lev}x.`);
+    if (minN && notional < minN * 1.02) throw new UserError(`Too small: the minimum ${card.base}-PERP order is about ${(minN * 1.02).toFixed(2)} USDso notional. Pick a larger size.`);
     const mark = await this.venue.mark(m);
     if (!mark) throw new UserError(`${card.base}-PERP has no fresh mark price right now. Nothing was sent.`);
     const existing = (await this.venue.account(owner)).positions.find((x) => x.base === card.base);
     if (existing && existing.side !== card.side) throw new UserError(`You hold a ${existing.side} on ${card.base}-PERP. Close it first with /close ${card.base} (a copy never flips a position).`);
     const now = Date.now();
     for (const [k, d] of this.drafts) if (d.exp <= now) this.drafts.delete(k);
+    // A user's own older previews make way first, so one user can never push out other users' drafts.
+    const mine = [...this.drafts].filter(([, d]) => d.uid === u.id).map(([k]) => k);
+    for (const k of mine.slice(0, Math.max(0, mine.length - (LIMITS.draftsPerUser - 1)))) this.drafts.delete(k);
     while (this.drafts.size >= LIMITS.draftsMax) this.drafts.delete(this.drafts.keys().next().value!);
     let nonce = randomBytes(6).toString("hex");
     while (this.drafts.has(nonce)) nonce = randomBytes(6).toString("hex");
     this.drafts.set(nonce, { uid: u.id, owner: owner.toLowerCase(), card: card.id, base: card.base, side: card.side, margin, lev, exp: now + LIMITS.draftTtlMs });
+    const oldSl = existing && u.rules[card.base]?.side === existing.side ? u.rules[card.base]?.sl : undefined;
+    const pct = LIMITS.cardCopyMaxTouchPct;
     await this.say(chat,
       `<b>Copy preview</b>\nOpen ${card.side} ${card.base} ${fmtUsd(margin)} x ${lev}x = ${fmtUsd(notional)} USDso at market (mark ${fmtPrice(mark)})${existing ? `; this adds to your ${card.base} ${existing.side}` : ""}.\n` +
       (note ? `${h(note)}\n` : "") +
-      `Refused if the book is more than ${LIMITS.cardCopyMaxTouchPct}% from the mark. Confirm within ${Math.round(LIMITS.draftTtlMs / 60_000)} minutes; the button works once.`,
+      `One-time order on your account: I don't follow the sharer's exits. Set your own (Confirm + SL 3%, /tp, /close).\n` +
+      (oldSl !== undefined ? `Confirm + SL 3% keeps your stop-loss ${fmtPrice(oldSl)} if it is tighter than 3% from the fill.\n` : "") +
+      `Fills only within ${pct}% of the mark: refused if the book is more than ${pct}% from the mark. Confirm within ${Math.round(LIMITS.draftTtlMs / 60_000)} minutes; the button works once.`,
       [[{ text: "Confirm", callback_data: `cx:${nonce}:0` }], [{ text: "Confirm + SL 3%", callback_data: `cx:${nonce}:1` }]]);
   }
 
@@ -825,15 +968,23 @@ export class Bot {
     const cards = this.store.cardsBy(u.id).filter((c) => c.at >= since);
     const sum = (k: "taps" | "newUsers" | "copies") => cards.reduce((a, c) => a + c[k], 0);
     await this.say(chat,
-      `<b>Your invite link</b>\n${link}\nTraders who joined through your links and cards: ${this.store.refCount(u.ref)}\n\n` +
-      `<b>Your cards, last 30 days</b>\nCards made: ${cards.length} · taps: ${sum("taps")} · new traders: ${sum("newUsers")} · copies: ${sum("copies")}\n\n` +
+      `<b>Your invite link</b>\n${link}\nPeople who joined through your links and cards: ${this.store.refCount(u.ref)}\n\n` +
+      `<b>Your cards, last 30 days</b>\nCards made: ${cards.length} · taps: ${sum("taps")} · new users: ${sum("newUsers")} · copies: ${sum("copies")}\n\n` +
       `Make a card with /card and forward it: friends tap <b>Copy this trade</b> to open the same trade on their own account.`);
   }
 
   // ---------- /watch: read-only liquidation pings for any account ----------
   private watchUsage(pct: number): string {
     return `<code>/watch 0xAccount</code> sends you a warning when a position on that dreamDEX account gets within ${pct}% of liquidation (change it with /alerts). ` +
-      `Read only: no link, no key, no trading. Up to ${LIMITS.watchesPerUser} accounts; /unwatch removes one.`;
+      `Read only: no link, no key, no trading. Up to ${LIMITS.watchesPerUser} accounts; /unwatch removes one. ` +
+      `Watches stay on while you use the bot: after ${Math.round(LIMITS.watchIdleMs / 86_400_000)} days without a message from you they end, and I tell you.`;
+  }
+
+  /** Why `arg` cannot be watched, or undefined when it can. */
+  private watchAddrProblem(arg: string | undefined, pct: number): string | undefined {
+    if (!isAddress(arg)) return `That is not an account address.\n${this.watchUsage(pct)}`;
+    if (BigInt(arg) === 0n) return "That is the zero address: nothing to watch.";
+    return undefined;
   }
 
   private watchSummary(addr: string, view: { equity?: number; positions: { base: string; side: Side; size: number; mark?: number; liq?: number }[] }): string {
@@ -867,9 +1018,9 @@ export class Bot {
         mine.map((w) => [{ text: `Unwatch ${w.addr.slice(0, 6)}…${w.addr.slice(-4)}`, callback_data: `uw:${w.addr.slice(2).toLowerCase()}` }]));
       return;
     }
-    if (!isAddress(arg)) { await this.say(chat, `That is not an account address.\n${this.watchUsage(u.liqWarnPct)}`); return; }
-    const addr = getAddress(arg);
-    if (BigInt(addr) === 0n) { await this.say(chat, "That is the zero address: nothing to watch."); return; }
+    const bad = this.watchAddrProblem(arg, u.liqWarnPct);
+    if (bad) { await this.say(chat, bad); return; }
+    const addr = getAddress(arg!);
     if (!this.buckets.allow(`watch:${u.id}`, LIMITS.watchAddsPer10Min, 10 * 60_000)) { await this.say(chat, "Too many /watch requests: please wait a few minutes."); return; }
     const lower = addr.toLowerCase();
     if (mine.some((w) => w.addr.toLowerCase() === lower)) { await this.say(chat, `You already watch ${addrLink(addr)}. /watch lists your accounts.`, this.watchButtons(u, addr)); return; }
@@ -883,7 +1034,8 @@ export class Bot {
     if (this.protector.watchView(addr).at === undefined) view = await this.venue.account(addr).catch(() => ({ positions: [] })); // e.g. your own linked account
     await this.say(chat,
       `👀 <b>Watching</b> ${this.watchSummary(addr, view)}\n\n` +
-      `I warn you when a position gets within ${u.liqWarnPct}% of liquidation (/alerts changes it) and tell you when a warned position is gone. Read only: nothing is ever sent for this account.`,
+      `I warn you when a position gets within ${u.liqWarnPct}% of liquidation (/alerts changes it; again only if it gets twice as close) and tell you when a warned position is gone. Read only: nothing is ever sent for this account. ` +
+      `Watches end after ${Math.round(LIMITS.watchIdleMs / 86_400_000)} days without a message from you.`,
       this.watchButtons(u, addr));
   }
 
@@ -919,6 +1071,7 @@ export class Bot {
   private async guardIt(u: User, chat: number, addr: `0x${string}`): Promise<void> {
     if (u.owner?.toLowerCase() === addr.toLowerCase()) { await this.say(chat, "This account is already linked here: /tp, /sl, /alerts and /guard work on it."); return; }
     if (u.owner) { await this.say(chat, `One account per Telegram user: you are linked to ${addrLink(u.owner)}. Send /unlink first, then link this one.`); return; }
+    if (!(await this.giveKey(u, chat)) || !hasKey(u)) return; // a watcher gets their bot key now
     await this.say(chat,
       `<b>Guard ${addr.slice(0, 6)}…${addr.slice(-4)}</b> (if it is your account)\n` +
       `1. In <a href="${APP_URL}">app.testnet.dreamdex.io</a> connect the wallet of that account, open it, <b>Link a bot</b>.\n` +
@@ -936,9 +1089,18 @@ export class Bot {
       // Buttons from /demo work before /start.
       if (data === "dc") { await this.demoCard(q.from.id, chat); return; }
       if (data === "st") { await this.cmdStart(q.from.id, chat); return; }
-      if (data === "wd") { const r = await this.ensureUser(q.from.id, chat); if (r) await this.cmdWatch(r.user, chat, this.demoAccount); return; }
-      const u = this.store.get(q.from.id);
-      if (!u) { await this.say(chat, "Send /start first."); return; }
+      if (data === "wd") { const r = await this.ensureUser(q.from.id, chat, { key: false }); if (r) await this.cmdWatch(r.user, chat, this.demoAccount); return; }
+      const wu = this.store.get(q.from.id);
+      if (!wu) { await this.say(chat, "Send /start first."); return; }
+      // Watch buttons work for watch-only records (no key).
+      const wm = /^(uw|wg):([0-9a-f]{40})$/.exec(data);
+      if (wm) {
+        const addr = getAddress(`0x${wm[2]!}`);
+        if (wm[1] === "uw") await this.cmdUnwatch(wu, chat, addr); else await this.guardIt(wu, chat, addr);
+        return;
+      }
+      if (!hasKey(wu)) { await this.say(chat, "Send /start first to get your personal bot key."); return; }
+      const u = wu;
       if (data === "chk") {
         if (!this.linkCheckAllowed(u.id)) { await this.say(chat, "Please wait a minute before checking again."); return; }
         const owners = await findLinkedOwners(this.venue.pub, u.keyAddress, 30);
@@ -954,9 +1116,14 @@ export class Bot {
         await this.attach(u, chat, getAddress(owners[0]!));
         return;
       }
-      const cl = /^cl:([A-Z0-9]{1,12}):(50|100)$/.exec(data);
+      const cl = /^cl:([A-Z0-9]{1,12}):(50|100)(?::([0-9a-f]{10}))?$/.exec(data);
       if (cl) {
         if (!this.venue.market(cl[1]!)) return;
+        // A button acts only on the account it was shown for (older buttons carry no account: refused).
+        if (!cl[3] || !u.owner || acctTag(u.owner) !== cl[3]) {
+          await this.say(chat, "That button is from an earlier message for an account you are no longer linked to (or from an older version). Nothing was sent. /positions shows fresh buttons.");
+          return;
+        }
         this.tradeAllowed(u);
         await this.doClose(u, chat, cl[1]!, Number(cl[2]) / 100, Number(cl[2]) === 100 ? "manual close" : "manual close 50%");
         return;
@@ -967,12 +1134,6 @@ export class Bot {
       if (cm) { await this.copyPreview(u, chat, cm[1]!, Number(cm[2])); return; }
       const cx = /^cx:([0-9a-f]{12}):([01])$/.exec(data);
       if (cx) { await this.copyConfirm(u, chat, cx[1]!, cx[2] === "1"); return; }
-      const wm = /^(uw|wg):([0-9a-f]{40})$/.exec(data);
-      if (wm) {
-        const addr = getAddress(`0x${wm[2]!}`);
-        if (wm[1] === "uw") await this.cmdUnwatch(u, chat, addr); else await this.guardIt(u, chat, addr);
-        return;
-      }
     } catch (e) {
       if (e instanceof UserError) { await this.say(chat, h(e.message)); return; }
       log("callback failed", String(e instanceof Error ? e.message : e).slice(0, 300));

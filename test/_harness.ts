@@ -74,6 +74,7 @@ export function makeBot(opts: { mark?: number; maxLev?: Record<string, number> }
     gasBalance: async () => 5,
     coverage: async () => ({ linked: ["ETH", "SOL"], missing: [] }),
     tradingKey: (_id: number, owner: string) => ({ owner, operator: OPERATOR }),
+    txState: async () => "none",
     forgetKey: () => {},
     reloadMarkets: async () => {},
     open: async (tk: { owner: string }, base: string, side: "long" | "short", notional: number, o: { maxTouchPct?: number }) => {
@@ -93,6 +94,8 @@ export function makeBot(opts: { mark?: number; maxLev?: Record<string, number> }
     watching: () => [{ pool: POOLS.ETH, base: "ETH", pushes: 42, ageMs: 100 }],
     refreshWatched: async (a?: string) => { watchRefreshes.push(a); },
     watchView: () => ({ equity: 500, at: Date.now(), positions: [] }),
+    dropUser: () => {},
+    idle: async () => {},
     stop: () => {},
   };
   const addUser = (id: number, owner?: `0x${string}`) => {

@@ -26,13 +26,13 @@ Screenshots are frames of the demo recording (2026-10-20, Telegram Desktop). The
 - **Positions with PnL.** `/positions` shows size, entry, mark, unrealised PnL, return on margin, the liquidation price and how far away it is.
 - **Exits that act.** `/tp ETH 4%`, `/sl ETH 2300`, or inline: `/short BTC 15 10x tp 3% sl 1.5%`. The bot follows each market you hold through **Somnia Reactivity** and closes the position when a level is reached. A take-profit exits with an order capped at the TP price, so it never fills worse than the level; a stop-loss exits at market.
 - **Liquidation alerts, and a guard.** You get a warning with *Close 50%* / *Close all* buttons when the mark comes within your distance of the liquidation price (`/alerts 10`). `/guard 3` closes the position for you when it gets within 3%.
-- **Cards friends can copy.** `/card` renders an image of the trade (with a mark-price sparkline). Forward it anywhere: **Copy this trade** opens a landing with the trade, the mark now and the move since entry, then a 10 / 25 / 50 USDso preview and a single-use Confirm (optionally with a 3 % stop-loss). The copy is a normal order on the copier's own account.
-- **Watch any account.** `/watch 0x…` warns you when a position on that account nears liquidation and tells you when it is gone. Every alert offers **Guard it: link this account**, which leads to `/guard`.
+- **Cards friends can copy.** `/card` renders an image of the trade (with a mark-price sparkline). Forward it anywhere: **Copy this trade** opens a landing with the trade, the mark now and the move since entry, then a 10 / 25 / 50 USDso preview and a single-use Confirm (optionally with a 3 % stop-loss, which never loosens a stop you already have). The copy is a one-time order on the copier's own account: it does not follow the sharer's exits, and it never fills more than 0.5 % from the mark.
+- **Watch any account.** `/watch 0x…` warns you once when a position on that account nears liquidation (again only if it gets twice as close) and tells you when a position it warned you about is gone. Every alert offers **Guard it: link this account**, which leads to `/guard`.
 - **A demo for anyone.** `/demo` shows the bot's own live account and its recent orders before you link anything.
 
 ## Loops
 
-- **Copy loop.** Trade, `/card`, forward. A friend taps **Copy this trade**: a new user's tapped card waits through onboarding and comes back right after they link. The sharer gets a short attribution ping (at most 6 an hour) and `/invite` counts the taps, new traders and copies of their cards. The landing never shows the sharer's account or Telegram identity.
+- **Copy loop.** Trade, `/card`, forward. A friend taps **Copy this trade**: a new user's tapped card waits through onboarding and comes back right after they link. The sharer gets a short attribution ping (at most 6 an hour) and `/invite` counts the taps, new users and copies of their cards. Pressing `/card` again for the same trade refreshes the same card, so a link that was already forwarded keeps working. The landing never shows the sharer's account or Telegram identity.
 - **Watch loop.** `/watch` works for any account with no link. Each alert offers to link the account so that `/guard` can act, not only warn.
 - **Repeat use.** Exits, alerts and the guard bring the trader back on every move.
 
@@ -59,7 +59,7 @@ You never give the bot your wallet. On `/start` the bot generates a **personal b
 | Command | What it does |
 |---|---|
 | `/demo` | A live account run by this bot: equity, positions, last orders with tx links, live streams. No wallet needed |
-| `/watch 0x…` / `/unwatch` | Liquidation pings for any account, read only (up to 3) |
+| `/watch 0x…` / `/unwatch` | Liquidation pings for any account, read only (up to 3; they end after 7 days without a message from you) |
 | `/start` | Onboarding, your bot key, the Link a bot steps |
 | `/long ETH 20 5x` / `/short BTC 15 10x` | Market order: margin in USDso x leverage; optional `tp 4% sl 2%` or absolute prices |
 | `/close ETH` / `/close ETH 50%` | Close all or part of a position |
@@ -67,7 +67,7 @@ You never give the bot your wallet. On `/start` the bot generates a **personal b
 | `/tp ETH 2500`, `/sl ETH 2%`, `/tp ETH off` | Bot-watched take-profit / stop-loss |
 | `/alerts 10`, `/guard 3`, `/guard off` | Liquidation warning distance; auto-close distance |
 | `/card [ETH]` | PnL card image with a **Copy this trade** link |
-| `/invite` | Your invite link, who joined through it, and your cards' taps / new traders / copies (30 days) |
+| `/invite` | Your invite link, who joined through it, and your cards' taps / new users / copies (30 days) |
 | `/markets`, `/status`, `/key` | Marks and max leverage, account + gas + live streams, your bot key |
 
 Leverage: the venue sets margin per market (5 %, 10 % or 20 % initial margin, i.e. 20x / 10x / 5x max), and the account's own cap is owner-only. The bot treats `5x` as sizing (notional = margin x leverage), checks it against the market maximum and the account cap, and asks the pool (`getMaxPerpOrderSize`) whether the account can take the size before anything is sent.
@@ -130,7 +130,7 @@ Requirements: Node 22, a Telegram bot token, Linux with `bwrap` for the jail (op
 ```bash
 git clone https://github.com/swiftbotlab/dreamdex-perps-copilot && cd dreamdex-perps-copilot
 npm ci --ignore-scripts
-npm test                      # 67 tests: parsing, key vault, card, protection, close races, send outcomes, card copies, /watch, /demo
+npm test                      # 93 tests: parsing, key vault, card, protection, close races, send outcomes, card copies, /watch, /demo, shutdown
 npm run build                 # bundles dist/bot.mjs + dist/resvg.wasm
 
 # secrets live outside the repo, one KEY=VALUE per line, chmod 600
@@ -164,10 +164,10 @@ Telegram  <-- long polling (Bot API over fetch) -->  src/bot.ts   commands, butt
 
 - Testnet only: the bot asserts chain id 50383 at startup and refuses anything else.
 - Reads (positions, mark, liquidation price, margin, max order size, close preview) take the account explicitly, so one client serves all users.
-- Writes use the trading-key helpers from the official dreamDEX bot kit (`src/vendor/perp-core`, MIT, one change: no `.env` loading).
-- Market orders are immediate-or-cancel at the touch +/- 30 bps, refused when the book is more than 1.5 % from the mark (0.5 % for card copies).
-- One send at a time per bot key (no two orders on one nonce), and every failed send is labelled by the step that failed: an order that may have reached the chain is reported as "not confirmed, check /positions", never as "nothing was sent", and is never resent automatically.
-- One instance only: a heartbeat lock file in `data/` refuses a second copy of the bot.
+- Writes use the trading-key helpers from the official dreamDEX bot kit (`src/vendor/perp-core`, MIT; local changes listed in [its README](src/vendor/perp-core/README.vendored.md)).
+- Market orders are immediate-or-cancel at the touch +/- 30 bps, refused when the book is more than 1.5 % from the mark. Card copies are refused beyond 0.5 % and never fill further than 0.5 % from the mark.
+- Each order is signed in the bot and its hash is known before it is posted. A bot key picks nonces and posts one order at a time. Every failed send is labelled by the step that failed: an order that may have reached the chain is reported as "not confirmed, check /positions" with its tx hash, never as "nothing was sent", and is never resent automatically. Until the chain shows that order mined or gone, no new order is sent on that account and market.
+- One instance only: a heartbeat lock file in `data/` refuses a second copy of the bot. On a restart the bot stops taking new trades, finishes the orders already in flight (at most 70 s), then releases the lock.
 
 ## Roadmap
 

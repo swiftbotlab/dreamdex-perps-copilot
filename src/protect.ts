@@ -16,8 +16,10 @@ const SILENT_MS = 15_000;
 const RESUB_MS = 90_000;
 const REFRESH_MS = 30_000;
 
-export interface Held { userId: number; base: string; pool: `0x${string}`; side: Side; size: number; entry: number; liq?: number }
-export type Act = (u: User, base: string, fraction: number, reason: string, opt: { kind: "tp" | "sl" | "guard"; limit?: number; side: Side }) => Promise<void>;
+/** A linked user's position as last read. `owner` (lowercase) is the account it was read from. */
+export interface Held { userId: number; owner: string; base: string; pool: `0x${string}`; side: Side; size: number; entry: number; liq?: number }
+/** `opt.owner`: the account the trigger was computed for; the close must go to that account or not at all. */
+export type Act = (u: User, base: string, fraction: number, reason: string, opt: { kind: "tp" | "sl" | "guard"; limit?: number; side: Side; owner?: string }) => Promise<void>;
 export type Warn = (u: User, base: string, text: string) => Promise<void>;
 /** A position of a watched account (addr lowercase). */
 export interface WHeld { addr: string; base: string; pool: `0x${string}`; side: Side; size: number; entry: number; liq?: number; mark?: number }
@@ -38,7 +40,10 @@ export class Protector {
   private watchWarned = new Map<string, Set<number>>(); // `${addr}:${base}` -> watcher ids warned about this position
   private watchWarn?: WatchWarn;
   private watchGone?: WatchGone;
+  private watchWarnDist = new Map<string, number>(); // `w:${userId}:${addr}:${base}` -> distance (%) at the last warning
   private watchRefreshing = false;
+  private running = new Set<Promise<unknown>>();     // acts in flight (drained on shutdown)
+  private stopped = false;
   private ws = createPublicClient({ chain, transport: webSocket(WS_URL, { keepAlive: { interval: 20_000 }, reconnect: { attempts: 1_000, delay: 2_000 }, timeout: 20_000 }) });
   stats = { pushes: 0, polls: 0, triggers: 0 };
   private timers: NodeJS.Timeout[] = [];
@@ -55,7 +60,14 @@ export class Protector {
 
   /** Attach the watch-alert handlers (a setter, so the constructor stays as it was). */
   onWatch(warn: WatchWarn, gone: WatchGone): void { this.watchWarn = warn; this.watchGone = gone; }
-  stop(): void { for (const t of this.timers) clearInterval(t); for (const s of this.subs.values()) void s.unsubscribe?.().catch(() => {}); }
+  /** Stop the timers and streams; no new act starts after this (acts already running finish: see idle()). */
+  stop(): void {
+    this.stopped = true;
+    for (const t of this.timers) clearInterval(t);
+    for (const s of this.subs.values()) void s.unsubscribe?.().catch(() => {});
+  }
+  /** Resolves when no act (auto-close) is running. */
+  async idle(): Promise<void> { while (this.running.size) await Promise.allSettled([...this.running]); }
 
   sparkFor(base: string): number[] | undefined { return this.spark.get(base); }
   markFor(pool: string): number | undefined { return this.subs.get(pool.toLowerCase())?.mark; }
@@ -65,12 +77,15 @@ export class Protector {
 
   /** Re-read one user's positions (after a trade, or on the periodic sweep). */
   async refreshUser(u: User): Promise<void> {
-    if (!u.owner) { this.dropUser(u.id); return; }
-    const view = await this.venue.account(u.owner);
+    const owner = u.owner?.toLowerCase();
+    if (!owner) { this.dropUser(u.id); return; }
+    const view = await this.venue.account(u.owner!);
+    // Relinked or unlinked while this read was in flight: the view belongs to an account the user left.
+    if (u.owner?.toLowerCase() !== owner) return;
     const seen = new Set<string>();
     for (const p of view.positions) {
       seen.add(p.base);
-      this.held.set(`${u.id}:${p.base}`, { userId: u.id, base: p.base, pool: p.pool, side: p.side, size: p.size, entry: p.entry, liq: p.liq });
+      this.held.set(`${u.id}:${p.base}`, { userId: u.id, owner, base: p.base, pool: p.pool, side: p.side, size: p.size, entry: p.entry, liq: p.liq });
       const r = u.rules[p.base];
       if (r && r.side !== p.side) { delete u.rules[p.base]; this.store.save(); } // flipped elsewhere: old rule is meaningless
     }
@@ -84,9 +99,13 @@ export class Protector {
     this.syncSubs();
   }
 
-  private dropUser(id: number): void {
-    for (const k of [...this.held.keys()]) if (k.startsWith(`${id}:`)) this.held.delete(k);
-    this.syncSubs();
+  /** Forget a user's positions, warning and back-off state at once (call it BEFORE the user's account changes). */
+  dropUser(id: number): void {
+    let n = 0;
+    for (const m of [this.held, this.lastWarn, this.coolUntil] as Map<string, unknown>[]) {
+      for (const k of [...m.keys()]) if (k.startsWith(`${id}:`)) { m.delete(k); n++; }
+    }
+    if (n) this.syncSubs();
   }
 
   private refreshing = false;
@@ -97,6 +116,10 @@ export class Protector {
   }
 
   private async sweep(): Promise<void> {
+    for (const h of [...this.held.values()]) {
+      const u = this.store.get(h.userId);
+      if (!u || u.owner?.toLowerCase() !== h.owner) this.dropUser(h.userId); // gone, unlinked or relinked
+    }
     for (const u of this.store.all()) {
       if (!u.owner) continue;
       try { await this.refreshUser(u); } catch (e) { this.log("refresh failed", String(e).slice(0, 120)); }
@@ -143,6 +166,7 @@ export class Protector {
       const k = `${a}:${p.base}`;
       const prev = this.watchHeld.get(k);
       if (prev && prev.side !== p.side) await this.watchEnded(k, prev); // flipped: the warned position is gone
+      else if (prev && prev.size !== p.size) this.clearWatchWarn(k);   // resized: a new warning may follow
       seen.add(p.base);
       this.watchHeld.set(k, { addr: a, base: p.base, pool: p.pool, side: p.side, size: p.size, entry: p.entry, liq: p.liq, mark: p.mark });
     }
@@ -155,8 +179,8 @@ export class Protector {
   private async watchEnded(k: string, w: WHeld): Promise<void> {
     const ids = this.watchWarned.get(k);
     this.watchWarned.delete(k);
+    this.clearWatchWarn(k);
     for (const id of ids ?? []) {
-      this.lastWarn.delete(`w:${id}:${k}`);
       const u = this.store.get(id);
       if (!u || u.blockedAt || !u.watches?.some((x) => x.addr.toLowerCase() === w.addr)) continue;
       await this.watchGone?.(u, w.addr, w.base, w.side).catch(() => {});
@@ -165,8 +189,15 @@ export class Protector {
 
   private forgetWatched(k: string): void {
     this.watchHeld.delete(k);
-    for (const id of this.watchWarned.get(k) ?? []) this.lastWarn.delete(`w:${id}:${k}`);
+    this.clearWatchWarn(k);
     this.watchWarned.delete(k);
+  }
+
+  /** Forget the per-watcher warning state of one watched position (`${addr}:${base}`). */
+  private clearWatchWarn(k: string): void {
+    for (const m of [this.lastWarn, this.watchWarnDist] as Map<string, unknown>[]) {
+      for (const ck of [...m.keys()]) if (ck.startsWith("w:") && ck.endsWith(`:${k}`)) m.delete(ck);
+    }
   }
 
   private syncSubs(): void {
@@ -219,6 +250,7 @@ export class Protector {
   }
 
   async onMark(pool: string, mark: number, _source: "push" | "poll" = "push"): Promise<void> {
+    if (this.stopped) return;
     const s = this.subs.get(pool);
     if (s) s.mark = mark;
     const m = this.venue.marketByPool(pool);
@@ -229,7 +261,7 @@ export class Protector {
     for (const h of this.held.values()) {
       if (h.pool.toLowerCase() !== pool) continue;
       const u = this.store.get(h.userId);
-      if (!u) continue;
+      if (!u || u.owner?.toLowerCase() !== h.owner) continue; // never act or warn on a position read from an account the user left
       const key = `${h.userId}:${h.base}`;
       if (this.inflight.has(key) || Date.now() < (this.coolUntil.get(key) ?? 0)) continue;
       const rule = u.rules[h.base];
@@ -243,7 +275,10 @@ export class Protector {
       if (!reason && dist !== undefined && u.guardPct && dist <= u.guardPct) { reason = `liquidation guard: mark ${fmtPrice(mark)} is ${dist.toFixed(2)}% from liquidation ${fmtPrice(h.liq!)}`; opt = { kind: "guard", side: h.side }; }
       if (reason) {
         this.inflight.add(key); this.stats.triggers++;
-        try { await this.act(u, h.base, 1, reason, opt); } catch { this.coolUntil.set(key, Date.now() + (opt.kind === "tp" ? 4_000 : 30_000)); } finally {
+        const run = this.act(u, h.base, 1, reason, { ...opt, owner: h.owner });
+        this.running.add(run);
+        try { await run; } catch { this.coolUntil.set(key, Date.now() + (opt.kind === "tp" ? 4_000 : 30_000)); } finally {
+          this.running.delete(run);
           this.inflight.delete(key);
           await this.refreshUser(u).catch(() => {});
         }
@@ -264,10 +299,16 @@ export class Protector {
       const dist = liqDistancePct(w.side, mark, w.liq);
       if (dist === undefined) continue;
       for (const u of this.store.watchersOf(w.addr)) {
-        if (u.blockedAt || u.owner?.toLowerCase() === w.addr || dist > u.liqWarnPct) continue;
+        if (u.blockedAt || u.owner?.toLowerCase() === w.addr) continue;
         const ck = `w:${u.id}:${k}`;
-        if (Date.now() - (this.lastWarn.get(ck) ?? 0) <= LIMITS.liqWarnCooldownMs) continue;
+        const prev = this.watchWarnDist.get(ck);
+        // Once per position: again only when the distance has halved, or after it left the zone (2x the
+        // warning distance) and came back. A resized, flipped or closed position starts afresh.
+        if (dist > u.liqWarnPct) { if (prev !== undefined && dist > 2 * u.liqWarnPct) this.watchWarnDist.delete(ck); continue; }
+        if (prev !== undefined && dist > prev / 2) continue;
+        if (Date.now() - (this.lastWarn.get(ck) ?? 0) <= LIMITS.watchWarnMinGapMs) continue;
         this.lastWarn.set(ck, Date.now());
+        this.watchWarnDist.set(ck, dist);
         let ids = this.watchWarned.get(k);
         if (!ids) this.watchWarned.set(k, (ids = new Set()));
         ids.add(u.id);

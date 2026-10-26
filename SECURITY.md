@@ -53,45 +53,73 @@
   **Confirm**. The preview button (`cm:`) sends nothing, so replaying it is harmless. The preview stores a
   server-side draft under a random 12-hex nonce, bound to the copier's Telegram id and linked account,
   valid 10 minutes and usable **once**: it is taken out before anything else runs, so a double tap or a
-  retry never sends a second order. At most 1,000 drafts are held, in memory only.
+  retry never sends a second order. At most 3 drafts per user (a user's own older ones make way) and
+  1,000 in total are held, in memory only.
 - The copy reuses the normal open path (same per account+market lock, account leverage cap, gas check,
   no flips, minimum size) with a tighter touch limit: refused when the book is more than **0.5 %** from
-  the mark. Leverage is the card's, capped at 10x and the market maximum (3x when the card has none),
-  and the cap is stated in the preview.
+  the mark, and the IOC limit itself is capped at the mark +/- 0.5 %, so a sharer who stacks the book
+  cannot fill a copier further away than the preview says. Leverage is the card's, capped at 10x and the
+  market maximum (3x when the card has none), and the cap is stated in the preview.
+- "Confirm + SL 3%" on a copy that adds to a position keeps the user's own stop-loss when it is tighter
+  (the preview says so). The preview states that the copy is a one-time order that does not follow
+  the sharer's exits.
 - A card landing shows the trade only (market, side, leverage, entry, exit or mark, PnL). It never shows
   the sharer's account or Telegram identity. Card ids are 10 random hex characters; cards expire after
-  30 days (at most 20 per user, 1,000 in total). Card payloads are validated as `[rc]_[0-9a-f]{10}`.
+  30 days. A new `/card` for the same trade reuses its card. Per user, beyond 20 cards the oldest ones
+  nobody tapped or copied go first; 1,000 cards in total. A pruned card's id keeps only its sharer's share
+  code (at most 5,000 kept), so a late tap gets "That shared trade has expired" and still credits the
+  sharer. Card payloads are validated as `[rc]_[0-9a-f]{10}`.
 - Attribution pings to a sharer are rate limited (6/hour) and stop when Telegram reports the user
   blocked the bot; any later message from that user resumes them.
 
 ## Watch mode (`/watch`)
 - Read only: no key, no link, nothing is ever sent for a watched account. It reads public chain state
   (the account's positions every 60 s, in sequence) and the mark pushes the bot already receives.
+- Watch-only users get a record with **no bot key** (a key is made only on `/start`, within the normal
+  sign-up caps and the 40-keys-per-hour quota). The address is validated before any record is made, and
+  `/unwatch` from a stranger makes none. Watch-only records are capped at 1,000, separately from the 500
+  users with keys.
 - Caps: 3 accounts per user, 100 distinct watched accounts in total, 5 adds per 10 minutes. Addresses
   must be 40-hex (checksummed by the bot); the zero address is refused. An account watched only by its
   own linked user is not read twice (its regular warnings cover it).
-- Users who only watch (never link) keep their record and are not pruned after 48 h.
+- Watches end after 7 days without a message or button press from the watcher (they are told, and
+  can `/watch` again). The slots free up and the record is then pruned like any unlinked user, so the
+  100-address cap cannot be filled for good. Alerts for a watched position come once, again only when
+  the distance to liquidation has halved, after it left the zone (2x the warning distance) and came
+  back, or after the position changed size.
 
 ## Send outcomes
-- Every order send is labelled by the step that failed: the simulation (nothing reached the chain),
-  the raw send, the receipt wait (60 s timeout) or an on-chain revert. Only a failed simulation, or the
+- Every order send is labelled by the step that failed: the simulation or the preparation (nonce, fee
+  and chain-id reads, local signing; nothing was posted), the post of the signed transaction, the
+  receipt wait (60 s timeout) or an on-chain revert. Only a failed simulation or preparation, or the
   node refusing the raw transaction for gas money, is reported as "nothing was sent". Anything after
-  that is reported as **not confirmed** ("check /positions; I will not resend it"), with the tx hash when
-  known, and logged as an `unknown` row that `scripts/evidence.ts` re-verifies from the chain.
-- The order is never resent automatically: the write transport has `retryCount: 0`, a copy draft is
-  used up before the send, and an unconfirmed close blocks a repeat on the same size for 20 s; the next
-  attempt starts from a fresh chain read.
-- One send at a time per bot key (innermost lock; lock order account+market -> tx slots -> key), so two
-  orders never pick the same nonce.
+  that is reported as **not confirmed** ("check /positions; I will not resend it") with the tx hash (the
+  bot signs locally and hashes the signed bytes before posting), and logged as an `unknown` row that
+  `scripts/evidence.ts` re-verifies from the chain.
+- The order is never resent automatically. viem posts `eth_sendRawTransaction` without retries (reads
+  keep their retries), a copy draft is used up before the send, and while an order's outcome is unknown
+  no new order is sent on that account + market (auto or manual) until the chain shows it mined or gone
+  (receipt, or pending nonce = latest nonce). An unconfirmed close also blocks a repeat on the same size
+  for 20 s.
+- Nonce choice and posting run one at a time per bot key (innermost lock; lock order account+market ->
+  tx slots -> key), with the key's next nonce tracked locally, so two orders never pick the same nonce.
+  The receipt wait runs outside that lock, so a stop-loss on another market is not held up by a slow receipt.
 
 ## Single instance
 - `data/instance.lock` is created with `O_EXCL` before any chain or Telegram traffic; its mtime is a
   heartbeat refreshed every 5 s. A second instance (for example a dev run next to the service) exits
   with code 3 while the heartbeat is younger than 12 s; systemd retries every 15 s, so the service comes
   back once the other copy stops. A stale lock from a crashed process is replaced. SIGTERM / SIGINT
-  stop polling (unconfirmed updates go to the next instance) and release the lock.
-- A relink to another account clears that user's TP/SL, open records, last close and pending copy, so
-  an exit set on the old account can never act on the new one.
+  stop polling (unconfirmed updates go to the next instance), stop new trades and auto-closes, wait for
+  the orders already in flight (at most 70 s, under systemd's 90 s stop timeout), and only then release
+  the lock.
+- A relink to another account clears that user's TP/SL, open records, last close and pending copy, and
+  drops the positions the protection loop holds for them before the account changes. Every held position
+  records the account it was read from: a read that lands after a relink is discarded, and no exit,
+  guard or warning acts on a position from an account the user left. Close buttons carry a tag of the
+  account they were shown for; a button from before a relink (or an older untagged one) sends nothing.
+  An exit that was already in flight during a relink is logged for the old account and leaves the new
+  account's records alone.
 
 ## Runtime isolation (verified on the host, 2026-10-20)
 - systemd user service `ops/ddmvp.service` -> `ops/run_sandboxed.sh bot`, a bubblewrap jail:
