@@ -5,7 +5,7 @@ Live on Somnia Tokyo testnet: [@SwiftPerpsBot](https://t.me/SwiftPerpsBot). Buil
 
 Proof clip on X (a stop-loss closed by the bot through Somnia Reactivity, then `/card`): https://x.com/swiftbotlab/status/2112695927035371609 · full demo video (112 s): [video/demo.mp4](video/demo.mp4)
 
-**So far:** 24 real orders on testnet, all `success` on chain; 6 of them were exits the bot fired by itself (take-profit / stop-loss). Measured: about 4 s from a take-profit hit to the close transaction. Table: [evidence/orders.md](evidence/orders.md).
+**So far:** 28 real orders on testnet, all `success` on chain; 7 of them were exits the bot fired by itself (take-profit / stop-loss), and 1 was opened from a shared card with **Copy this trade** (2026-10-26). Measured: about 4 s from a take-profit hit to the close transaction. Table: [evidence/orders.md](evidence/orders.md).
 
 ## Try it in 60 s
 
@@ -18,7 +18,7 @@ Proof clip on X (a stop-loss closed by the bot through Somnia Reactivity, then `
 |---|---|---|
 | ![A stop-loss reached and closed by the bot](evidence/tg_autoclose.png) | ![Liquidation risk alert with Close 50% and Close all](evidence/tg_liq_alert.png) | ![A PnL card in the chat](evidence/tg_card.png) |
 
-Screenshots are frames of the demo recording (2026-10-20, Telegram Desktop). The `/alerts 25` there is a demo setting that makes the alert fire within seconds; the default is 10 %. The card in the third frame predates the **Copy this trade** button: it carried an invite link only.
+Screenshots are frames of the demo recording (2026-10-20, Telegram Desktop). The `/alerts 25` there is a demo setting that makes the alert fire within seconds; the default is 10 %. The card in the third frame predates the **Copy this trade** button: it carried an invite link only. A current card, exactly as the bot sent it on 2026-10-26, is [evidence/tg_card_copy_link.jpg](evidence/tg_card_copy_link.jpg): the copy link is printed on the image as well as on the button.
 
 ## What it does
 
@@ -36,7 +36,16 @@ Screenshots are frames of the demo recording (2026-10-20, Telegram Desktop). The
 - **Watch loop.** `/watch` works for any account with no link. Each alert offers to link the account so that `/guard` can act, not only warn.
 - **Repeat use.** Exits, alerts and the guard bring the trader back on every move.
 
-Honest numbers (read 2026-10-26, before the copy loop and `/watch` went live): outside users so far: **0**. Every order in the evidence table is our own demo account. The card links are also printed on the image and in the caption, so a forward that drops the button still carries the link.
+### Share-link flow, step by step (what is on-chain and what is bot-side)
+
+1. `/card` (bot-side): the bot renders the PNG and stores a card record (market, side, leverage, entry, exit or mark). The link `t.me/SwiftPerpsBot?start=c_<id>` is on the **Copy this trade** button, in the caption and printed on the image.
+2. Forward (Telegram): the card can go to any chat or group; the bot does not need to be in it. Checked live on 2026-10-26: a card forwarded to Saved Messages kept its **Copy this trade** URL button with the same link.
+3. Tap (bot-side): the landing shows the trade, the mark now and the move since entry. A user who has not linked yet goes through `/start` first, and the card comes back right after the link.
+4. Margin button, then preview (bot-side, nothing sent): 10 / 25 / 50 USDso, leverage capped at 10x and at the market maximum, and a single-use draft that expires after 10 minutes.
+5. Confirm (on-chain): one `placeOrderFor(copierAccount, ...)` immediate-or-cancel order on the perp pool, sent by the copier's own linked bot key, with the limit price at most 0.5 % from the mark. This is the only step that touches the chain.
+6. After the fill (bot-side): an optional 3 % stop-loss watched through Somnia Reactivity, the sharer's attribution ping, and the counts in `/invite`.
+
+Honest numbers (read 2026-10-26 02:20 UTC, after this build went live): outside users so far: **0**. Every order in the evidence table is our own demo account, including the card copy below, which is our own card run back on the same account. The tests cover the second-user half (the sharer ping, a new user's held card, counts).
 
 ## Who it is for
 
@@ -84,7 +93,27 @@ Limits, said plainly: these are bot-side exits, not on-chain stop orders (a link
 
 All orders below were placed **by the bot**, through a bot key linked with the app's Link a bot, for the dreamDEX account `0x0e7E8DF6Eac2E14165b4fA4CB2BD4e445d0E3817`. The full table, re-verified from chain receipts by `scripts/evidence.ts`, is in [evidence/orders.md](evidence/orders.md) (CSV: [evidence/orders.csv](evidence/orders.csv)).
 
-24 orders on 2026-10-20, all `success`: 12 opens and 12 closes, of which 6 were fired by the bot itself (take-profit / stop-loss through Somnia Reactivity). Links go to the official Somnia explorer (Tokyo testnet). The `via` column marks orders opened from a shared card.
+28 orders, all `success`: 24 on 2026-10-20 and 4 on 2026-10-26 (14 opens, 14 closes), of which 7 were fired by the bot itself (take-profit / stop-loss through Somnia Reactivity). Links go to the official Somnia explorer (Tokyo testnet). The `via` column marks orders opened from a shared card.
+
+### Card copy evidence (live, 2026-10-26)
+
+The first orders of this build, sent right after the restart that put the card-copy loop and `/watch` live. Same demo account and bot key as above, testnet only. The card copy is **our own card run back** on our own account (no second user yet); it went through the same landing, preview and single-use Confirm that any copier gets.
+
+| UTC | step | tx | block | result |
+|---|---|---|---|---|
+| 02:14:00 | `/card` on the last closed trade (ETH-PERP long 10x, closed 10-20 at +4.38 USDso) | - (bot-side) | - | card `c_dd6869a3a6` with **Copy this trade** |
+| 02:14:13 | `/start c_dd6869a3a6`, then **10 USDso** | - (bot-side) | - | preview: 10 x 10x = 100 USDso, fills only within 0.5 % of the mark |
+| 02:14:47 | **Confirm + SL 3%**: copy open, ETH-PERP long 0.0432 @ 2,309.53 | [`0x887ca26690b163b68f7b9066c41a015152c05aab9646c91acd28cc5b97b0dbd7`](https://explorer.testnet.somnia.network/tokyo/tx/0x887ca26690b163b68f7b9066c41a015152c05aab9646c91acd28cc5b97b0dbd7) | 33287448 | success, `via card`; stop-loss 2,240.24 watched |
+| 02:15:06 | the same Confirm button pressed again | - | - | refused: "expired or was already used", nothing sent |
+| 02:16:48 | `/watch` a public third-party account (read only) | - | - | real alert: "BTC-PERP long, mark 79,685.59 is 2.6% from liquidation 77,588.70" at the default 10 % warning |
+| 02:17:27 | the card forwarded to Saved Messages | - | - | the **Copy this trade** URL button survived the forward |
+| 02:18:07 | `/close ETH` | [`0x74ff2f03338caa120fddfc49cf11425ea589d7ff5d1f08dd28cf565d7d012969`](https://explorer.testnet.somnia.network/tokyo/tx/0x74ff2f03338caa120fddfc49cf11425ea589d7ff5d1f08dd28cf565d7d012969) | 33289448 | success, closed 0.0432 @ 2,311.33 |
+| 02:18:36 | `/long SOL 10 5x tp 0.15% sl 0.15%` (tight levels chosen so an exit fires quickly) | [`0xd08da31b0a328b6e9eb84817a99ef74b1e8431471737e3835d91b5dac403dee5`](https://explorer.testnet.somnia.network/tokyo/tx/0xd08da31b0a328b6e9eb84817a99ef74b1e8431471737e3835d91b5dac403dee5) | 33289744 | success, long 0.49 @ 101.14 |
+| 02:18:41 | stop-loss 100.988 reached (mark 100.982), closed by the bot | [`0xae8c3ae7369b11bf307cc046a882f4071efae94fc0763fa987e454e0c31e0867`](https://explorer.testnet.somnia.network/tokyo/tx/0xae8c3ae7369b11bf307cc046a882f4071efae94fc0763fa987e454e0c31e0867) | 33289789 | success, closed 0.49 @ 101.08 |
+
+These four orders are also the first live run of the hardened send path (signed in the bot, hash known before posting, one post per key at a time).
+
+### All orders
 
 | time (UTC) | action | via | market | side | filled | avg price | tx | block | status |
 |---|---|---|---|---|---|---|---|---|---|
@@ -112,6 +141,10 @@ All orders below were placed **by the bot**, through a bot key linked with the a
 | 10-20 14:18:29 | close (stop-loss) |  | SOL-PERP | short | 0.92 | 107.95 | [0x6c37d66515…](https://explorer.testnet.somnia.network/tokyo/tx/0x6c37d6651549ce75974e50096882ecf1b4eebc3199c2eb2f64b6706156b53d17) | 28540182 | success |
 | 10-20 14:19:02 | open |  | ETH-PERP | long | 1.6271 | 2458.2179 | [0x426548fd87…](https://explorer.testnet.somnia.network/tokyo/tx/0x426548fd875ff6c74f82b5c18bc1835170d0bc35d1af94d92295e0abb42d15dc) | 28540509 | success |
 | 10-20 14:19:30 | close |  | ETH-PERP | short | 1.6271 | 2460.91 | [0x53f1f7f7f5…](https://explorer.testnet.somnia.network/tokyo/tx/0x53f1f7f7f5efbe2fecfab50c4cfc9e24cff200bc7eb7c92dc1d818824897b9b5) | 28540785 | success |
+| 10-26 02:14:47 | open | card | ETH-PERP | long | 0.0432 | 2309.53 | [0x887ca26690…](https://explorer.testnet.somnia.network/tokyo/tx/0x887ca26690b163b68f7b9066c41a015152c05aab9646c91acd28cc5b97b0dbd7) | 33287448 | success |
+| 10-26 02:18:07 | close |  | ETH-PERP | short | 0.0432 | 2311.33 | [0x74ff2f0333…](https://explorer.testnet.somnia.network/tokyo/tx/0x74ff2f03338caa120fddfc49cf11425ea589d7ff5d1f08dd28cf565d7d012969) | 33289448 | success |
+| 10-26 02:18:36 | open |  | SOL-PERP | long | 0.49 | 101.14 | [0xd08da31b0a…](https://explorer.testnet.somnia.network/tokyo/tx/0xd08da31b0a328b6e9eb84817a99ef74b1e8431471737e3835d91b5dac403dee5) | 33289744 | success |
+| 10-26 02:18:41 | close (stop-loss) |  | SOL-PERP | short | 0.49 | 101.08 | [0xae8c3ae736…](https://explorer.testnet.somnia.network/tokyo/tx/0xae8c3ae7369b11bf307cc046a882f4071efae94fc0763fa987e454e0c31e0867) | 33289789 | success |
 
 ![The take-profit close of the first SOL trade on the Somnia markets explorer (dev explorer, 2026-10-20)](evidence/explorer_tp_close.png)
 

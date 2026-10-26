@@ -1,6 +1,6 @@
 # Orders placed by the bot on Somnia Tokyo testnet (Hideki, chain 50383)
 
-Generated 2026-10-26T01:32:43.097Z by scripts/evidence.ts from the bot's order log, every row re-read from the chain: 24/24 receipts are `success`, sent by the user's linked bot key and calling `placeOrderFor(account, ...)` on the market's perp pool. "via card" marks an order opened from a shared card (Copy this trade).
+Generated 2026-10-26T02:19:43.536Z by scripts/evidence.ts from the bot's order log, every row re-read from the chain: 28/28 receipts are `success`, sent by the user's linked bot key and calling `placeOrderFor(account, ...)` on the market's perp pool. "via card" marks an order opened from a shared card (Copy this trade).
 
 | time (UTC) | action | via | market | side | filled | avg price | tx | block | status |
 |---|---|---|---|---|---|---|---|---|---|
@@ -28,3 +28,7 @@ Generated 2026-10-26T01:32:43.097Z by scripts/evidence.ts from the bot's order l
 | 10-20 14:18:29 | close (stop-loss) |  | SOL-PERP | short | 0.92 | 107.95 | [0x6c37d66515…](https://explorer.testnet.somnia.network/tokyo/tx/0x6c37d6651549ce75974e50096882ecf1b4eebc3199c2eb2f64b6706156b53d17) | 28540182 | success |
 | 10-20 14:19:02 | open |  | ETH-PERP | long | 1.6271 | 2458.2179 | [0x426548fd87…](https://explorer.testnet.somnia.network/tokyo/tx/0x426548fd875ff6c74f82b5c18bc1835170d0bc35d1af94d92295e0abb42d15dc) | 28540509 | success |
 | 10-20 14:19:30 | close |  | ETH-PERP | short | 1.6271 | 2460.91 | [0x53f1f7f7f5…](https://explorer.testnet.somnia.network/tokyo/tx/0x53f1f7f7f5efbe2fecfab50c4cfc9e24cff200bc7eb7c92dc1d818824897b9b5) | 28540785 | success |
+| 10-26 02:14:47 | open | card | ETH-PERP | long | 0.0432 | 2309.53 | [0x887ca26690…](https://explorer.testnet.somnia.network/tokyo/tx/0x887ca26690b163b68f7b9066c41a015152c05aab9646c91acd28cc5b97b0dbd7) | 33287448 | success |
+| 10-26 02:18:07 | close |  | ETH-PERP | short | 0.0432 | 2311.33 | [0x74ff2f0333…](https://explorer.testnet.somnia.network/tokyo/tx/0x74ff2f03338caa120fddfc49cf11425ea589d7ff5d1f08dd28cf565d7d012969) | 33289448 | success |
+| 10-26 02:18:36 | open |  | SOL-PERP | long | 0.49 | 101.14 | [0xd08da31b0a…](https://explorer.testnet.somnia.network/tokyo/tx/0xd08da31b0a328b6e9eb84817a99ef74b1e8431471737e3835d91b5dac403dee5) | 33289744 | success |
+| 10-26 02:18:41 | close (stop-loss) |  | SOL-PERP | short | 0.49 | 101.08 | [0xae8c3ae736…](https://explorer.testnet.somnia.network/tokyo/tx/0xae8c3ae7369b11bf307cc046a882f4071efae94fc0763fa987e454e0c31e0867) | 33289789 | success |

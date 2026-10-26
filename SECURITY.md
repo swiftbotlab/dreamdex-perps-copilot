@@ -121,7 +121,7 @@
   An exit that was already in flight during a relink is logged for the old account and leaves the new
   account's records alone.
 
-## Runtime isolation (verified on the host, 2026-10-20)
+## Runtime isolation (verified on the host, 2026-10-20; probe re-run with the same results on 2026-10-26)
 - systemd user service `ops/ddmvp.service` -> `ops/run_sandboxed.sh bot`, a bubblewrap jail:
   `/usr` and `/etc` read-only, the product dir read-only, only `data/` writable, the two secret files
   bound read-only, private `/tmp` and `/run`, everything else in `$HOME` invisible.
