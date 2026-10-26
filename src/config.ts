@@ -4,9 +4,12 @@ export const CHAIN_NAME = "Somnia Tokyo testnet";
 export const RPC_URL = "https://api.hideki2.infra.testnet.somnia.network";
 export const WS_URL = "wss://api.hideki2.infra.testnet.somnia.network/ws";
 export const INDEXER_URL = "https://hideki-dev.smk.somnia.host/v1/graphql";
-export const EXPLORER_TX = "https://smk-dev-markets-explorer-hideki-euw4-uzavbo36ra-ez.a.run.app/tx/";
-export const EXPLORER_ADDR = "https://smk-dev-markets-explorer-hideki-euw4-uzavbo36ra-ez.a.run.app/address/";
+// Official Somnia explorer, Tokyo testnet (links in messages only; the bot never fetches them).
+export const EXPLORER_TX = "https://explorer.testnet.somnia.network/tokyo/tx/";
+export const EXPLORER_ADDR = "https://explorer.testnet.somnia.network/tokyo/address/";
 export const APP_URL = "https://app.testnet.dreamdex.io";
+/** The live account this bot trades for in public (/demo): Perps Arena Wallet 1, paper USDso, testnet. */
+export const DEMO_ACCOUNT = "0x0e7E8DF6Eac2E14165b4fA4CB2BD4e445d0E3817" as const;
 
 const ROOT = process.env.DDMVP_ROOT ?? "/home/agent/agent/products/dreamdex-mvp";
 export const PATHS = {
@@ -36,4 +39,23 @@ export const LIMITS = {
   lowGasStt: 0.1,
   slippageBps: 30,
   maxTouchVsMarkPct: 1.5,
+  // card-copy loop
+  cardCopyMaxTouchPct: 0.5,           // a copy is refused when the book is further than this from the mark
+  cardCopyMaxLev: 10,                 // copies never use more leverage than this (or the market maximum)
+  cardMargins: [10, 25, 50] as const, // copy sizes offered on a shared card, USDso margin
+  cardsPerUser: 20,
+  cardsMax: 1_000,
+  cardTtlMs: 30 * 24 * 3_600_000,
+  pingsPerHour: 6,                    // attribution pings to one sharer
+  draftTtlMs: 600_000,                // a copy preview's Confirm button is valid for 10 minutes, once
+  draftsMax: 1_000,
+  pendingCopyTtlMs: 24 * 3_600_000,   // a new user's tapped card waits this long for them to link
+  tapsTracked: 5_000,
+  // /demo and /watch
+  demoPerMinute: 3,
+  demoCacheMs: 15_000,
+  watchesPerUser: 3,
+  watchedMax: 100,                    // distinct watched addresses across all users
+  watchAddsPer10Min: 5,
+  watchRefreshMs: 60_000,
 };

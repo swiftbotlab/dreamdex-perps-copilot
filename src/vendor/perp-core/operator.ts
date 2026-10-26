@@ -90,13 +90,14 @@ export function createTradingKey(opts: {
         "or set it to the DreamDEX account this bot key is linked to.",
     );
   }
-  const transport = http(opts.rpcUrl);
+  // Reads keep viem's default retries. Writes get none: a retried eth_sendRawTransaction could post the
+  // same signed order twice and then report the duplicate's error for a tx that went through.
   return {
     owner: opts.owner,
     operator: account.address,
     account,
-    publicClient: createPublicClient({ chain: opts.chain, transport }) as PublicClient,
-    walletClient: createWalletClient({ account, chain: opts.chain, transport }),
+    publicClient: createPublicClient({ chain: opts.chain, transport: http(opts.rpcUrl) }) as PublicClient,
+    walletClient: createWalletClient({ account, chain: opts.chain, transport: http(opts.rpcUrl, { retryCount: 0 }) }),
   };
 }
 
@@ -139,6 +140,31 @@ export function linkProblem(key: TradingKey, status: LinkStatus, market: string)
   );
 }
 
+/** Where a write failed. Only "simulate" means nothing reached the chain. */
+export type SendPhase = "simulate" | "send" | "wait" | "reverted";
+
+/**
+ * A failed write, labelled with the step that failed:
+ * - "simulate": the eth_call said it would revert; nothing was sent;
+ * - "send": signing or posting the raw transaction failed; it may or may not have reached the chain;
+ * - "wait": the transaction was posted (`hash`) but its receipt did not arrive in time;
+ * - "reverted": the receipt arrived with status reverted (`hash`).
+ */
+export class SendError extends Error {
+  constructor(
+    readonly phase: SendPhase,
+    message: string,
+    readonly hash?: `0x${string}`,
+    options?: { cause?: unknown },
+  ) {
+    super(message, options);
+    this.name = "SendError";
+  }
+}
+
+const RECEIPT_TIMEOUT_MS = 60_000;
+const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
 /** Send a write the way the SDK does: simulate first, so a revert arrives as its named error, then send and wait. */
 async function send(
   key: TradingKey,
@@ -146,18 +172,33 @@ async function send(
   functionName: "placeOrderFor" | "cancelOrderFor" | "reduceOrderFor",
   args: readonly unknown[],
 ) {
-  const { request } = await key.publicClient.simulateContract({
-    address: pool,
-    abi: OPERATOR_ABI,
-    functionName,
-    args: args as never,
-    account: key.account,
-    gas: ORDER_GAS,
-  });
-  const hash = await key.walletClient.writeContract(request as never);
-  const receipt = await key.publicClient.waitForTransactionReceipt({ hash });
+  let request: unknown;
+  try {
+    ({ request } = await key.publicClient.simulateContract({
+      address: pool,
+      abi: OPERATOR_ABI,
+      functionName,
+      args: args as never,
+      account: key.account,
+      gas: ORDER_GAS,
+    }));
+  } catch (e) {
+    throw new SendError("simulate", errText(e), undefined, { cause: e });
+  }
+  let hash: `0x${string}`;
+  try {
+    hash = await key.walletClient.writeContract(request as never);
+  } catch (e) {
+    throw new SendError("send", errText(e), undefined, { cause: e });
+  }
+  let receipt: Awaited<ReturnType<PublicClient["waitForTransactionReceipt"]>>;
+  try {
+    receipt = await key.publicClient.waitForTransactionReceipt({ hash, timeout: RECEIPT_TIMEOUT_MS });
+  } catch (e) {
+    throw new SendError("wait", errText(e), hash, { cause: e });
+  }
   if (receipt.status !== "success") {
-    throw new Error(`${functionName} REVERTED on-chain (tx ${hash}).`);
+    throw new SendError("reverted", `${functionName} REVERTED on-chain (tx ${hash}).`, hash);
   }
   return { hash, receipt };
 }

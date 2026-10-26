@@ -15,7 +15,7 @@ export interface CardData {
   open: boolean;
   spark?: number[];      // recent marks, oldest first
   botUsername: string;   // validated [A-Za-z0-9_]
-  ref: string;           // hex share code
+  start: string;         // deep-link payload: r_<10 hex> (invite) or c_<10 hex> (copy this card)
   when: Date;
 }
 
@@ -44,7 +44,7 @@ function sparkPath(v: number[], w: number, h: number): string {
 }
 
 export function cardSvg(d: CardData): string {
-  if (!/^[A-Z0-9]{1,12}$/.test(d.base) || !/^[A-Za-z0-9_]{5,32}$/.test(d.botUsername) || !/^[0-9a-f]{6,16}$/.test(d.ref)) {
+  if (!/^[A-Z0-9]{1,12}$/.test(d.base) || !/^[A-Za-z0-9_]{5,32}$/.test(d.botUsername) || !/^[rc]_[0-9a-f]{10}$/.test(d.start)) {
     throw new Error("card input rejected");
   }
   const { pct, levered } = returnPct(d);
@@ -52,7 +52,8 @@ export function cardSvg(d: CardData): string {
   const accent = up ? "#22c55e" : "#ef4444";
   const sideLabel = `${d.side.toUpperCase()}${d.leverage ? ` ${d.leverage}x` : ""}`;
   const pctText = `${up ? "+" : ""}${pct.toFixed(Math.abs(pct) >= 100 ? 0 : 2)}%`;
-  const link = `t.me/${d.botUsername}?start=r_${d.ref}`;
+  const link = `t.me/${d.botUsername}?start=${d.start}`;
+  const footer = d.start.startsWith("c_") ? "Copy this trade: " : "Trade perps from Telegram: ";
   const spark = d.spark && d.spark.length >= 8 ? d.spark.slice(-120) : undefined;
   const date = d.when.toISOString().slice(0, 16).replace("T", " ") + " UTC";
   const sideX = 88 + (d.base.length + 5) * 22 + 28;
@@ -78,7 +79,7 @@ export function cardSvg(d: CardData): string {
   ${spark ? `<g transform="translate(760,170)"><path d="${sparkPath(spark, 380, 230)} L380,230 L0,230 Z" fill="url(#glow)"/><path d="${sparkPath(spark, 380, 230)}" fill="none" stroke="${accent}" stroke-width="4" stroke-linejoin="round"/></g>
   <text x="760" y="440" font-family="Noto Sans" font-size="20" fill="#64748b">live mark via Somnia Reactivity</text>` : ""}
   <rect x="0" y="603" width="1200" height="72" fill="#0f172a"/>
-  <text x="64" y="648" font-family="Noto Sans" font-size="26" fill="#e2e8f0">Trade perps from Telegram: <tspan font-weight="700" fill="#38bdf8">${x(link)}</tspan></text>
+  <text x="64" y="648" font-family="Noto Sans" font-size="26" fill="#e2e8f0">${footer}<tspan font-weight="700" fill="#38bdf8">${x(link)}</tspan></text>
   <text x="1136" y="92" text-anchor="end" font-family="Noto Sans" font-size="20" fill="#64748b">${x(date)}</text>
 </svg>`;
 }

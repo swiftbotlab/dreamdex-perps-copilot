@@ -3,11 +3,13 @@
 // push re-checks the bot-watched take-profit / stop-loss and the liquidation distance of the users who
 // hold that market. A trigger closes the position with the user's trading key. If a market's socket is
 // silent for more than SILENT_MS, a polling fallback reads the mark over HTTP instead.
+// Watched accounts (/watch, read only): the same pushes check their liquidation distance and send warnings to
+// the watchers. Nothing is ever sent to the chain for a watched account.
 import { createPublicClient, decodeAbiParameters, toFunctionSelector, webSocket } from "viem";
 import { LIMITS, WS_URL } from "./config.ts";
 import { fmtPrice, liqDistancePct, triggered, type Side } from "./parse.ts";
 import type { Store, User } from "./store.ts";
-import { chain, type Venue } from "./venue.ts";
+import { chain, type AccountView, type Venue } from "./venue.ts";
 
 const MARK_SEL = toFunctionSelector("tryGetMarkPrice()");
 const SILENT_MS = 15_000;
@@ -17,6 +19,10 @@ const REFRESH_MS = 30_000;
 export interface Held { userId: number; base: string; pool: `0x${string}`; side: Side; size: number; entry: number; liq?: number }
 export type Act = (u: User, base: string, fraction: number, reason: string, opt: { kind: "tp" | "sl" | "guard"; limit?: number; side: Side }) => Promise<void>;
 export type Warn = (u: User, base: string, text: string) => Promise<void>;
+/** A position of a watched account (addr lowercase). */
+export interface WHeld { addr: string; base: string; pool: `0x${string}`; side: Side; size: number; entry: number; liq?: number; mark?: number }
+export type WatchWarn = (u: User, addr: string, base: string, text: string) => Promise<void>;
+export type WatchGone = (u: User, addr: string, base: string, side: Side) => Promise<void>;
 
 interface Sub { unsubscribe?: () => Promise<unknown>; lastPush: number; startedAt: number; mark?: number; pushes: number }
 
@@ -27,6 +33,12 @@ export class Protector {
   private lastWarn = new Map<string, number>();
   private coolUntil = new Map<string, number>();     // after a failed close: wait before retrying
   private spark = new Map<string, number[]>();      // base -> recent marks
+  private watchHeld = new Map<string, WHeld>();      // `${addr}:${base}`, watched accounts (read only)
+  private watchAcct = new Map<string, { equity: number; at: number }>();
+  private watchWarned = new Map<string, Set<number>>(); // `${addr}:${base}` -> watcher ids warned about this position
+  private watchWarn?: WatchWarn;
+  private watchGone?: WatchGone;
+  private watchRefreshing = false;
   private ws = createPublicClient({ chain, transport: webSocket(WS_URL, { keepAlive: { interval: 20_000 }, reconnect: { attempts: 1_000, delay: 2_000 }, timeout: 20_000 }) });
   stats = { pushes: 0, polls: 0, triggers: 0 };
   private timers: NodeJS.Timeout[] = [];
@@ -36,8 +48,13 @@ export class Protector {
   start(): void {
     this.timers.push(setInterval(() => void this.refreshAll().catch((e) => this.log("refresh error", String(e).slice(0, 160))), REFRESH_MS));
     this.timers.push(setInterval(() => void this.fallback().catch((e) => this.log("fallback error", String(e).slice(0, 160))), 5_000));
+    this.timers.push(setInterval(() => void this.refreshWatched().catch((e) => this.log("watch refresh error", String(e).slice(0, 160))), LIMITS.watchRefreshMs));
     void this.refreshAll().catch(() => {});
+    void this.refreshWatched().catch(() => {});
   }
+
+  /** Attach the watch-alert handlers (a setter, so the constructor stays as it was). */
+  onWatch(warn: WatchWarn, gone: WatchGone): void { this.watchWarn = warn; this.watchGone = gone; }
   stop(): void { for (const t of this.timers) clearInterval(t); for (const s of this.subs.values()) void s.unsubscribe?.().catch(() => {}); }
 
   sparkFor(base: string): number[] | undefined { return this.spark.get(base); }
@@ -86,8 +103,74 @@ export class Protector {
     }
   }
 
+  // ---------- watched accounts ----------
+  /** Cached view of a watched account (no RPC): equity, positions with the last pushed mark. */
+  watchView(addr: string): { equity?: number; at?: number; positions: WHeld[] } {
+    const a = addr.toLowerCase();
+    const acct = this.watchAcct.get(a);
+    return { equity: acct?.equity, at: acct?.at, positions: [...this.watchHeld.values()].filter((w) => w.addr === a) };
+  }
+
+  /** Every watcher of `addr` is the account's own linked user: their regular warnings cover it, skip the reads. */
+  private ownerCovered(addr: string): boolean {
+    const ws = this.store.watchersOf(addr);
+    return ws.length > 0 && ws.every((u) => u.owner?.toLowerCase() === addr);
+  }
+
+  /** Re-read one watched address, or (no argument) all of them in sequence, never two full sweeps at once. */
+  async refreshWatched(addr?: string): Promise<void> {
+    if (addr) return this.refreshWatchedList([addr.toLowerCase()]);
+    if (this.watchRefreshing) return;
+    this.watchRefreshing = true;
+    try { await this.refreshWatchedList(); } finally { this.watchRefreshing = false; }
+  }
+
+  private async refreshWatchedList(only?: string[]): Promise<void> {
+    const watched = new Set(this.store.watchedAddresses());
+    for (const [k, w] of [...this.watchHeld]) if (!watched.has(w.addr) || this.ownerCovered(w.addr)) this.forgetWatched(k);
+    for (const a of [...this.watchAcct.keys()]) if (!watched.has(a)) this.watchAcct.delete(a);
+    for (const a of (only ?? [...watched]).filter((x) => watched.has(x))) {
+      if (this.ownerCovered(a)) continue;
+      try { await this.applyWatched(a, await this.venue.account(a as `0x${string}`)); } catch (e) { this.log("watch refresh failed", String(e).slice(0, 120)); }
+    }
+    this.syncSubs();
+  }
+
+  private async applyWatched(a: string, view: AccountView): Promise<void> {
+    this.watchAcct.set(a, { equity: view.equity, at: Date.now() });
+    const seen = new Set<string>();
+    for (const p of view.positions) {
+      const k = `${a}:${p.base}`;
+      const prev = this.watchHeld.get(k);
+      if (prev && prev.side !== p.side) await this.watchEnded(k, prev); // flipped: the warned position is gone
+      seen.add(p.base);
+      this.watchHeld.set(k, { addr: a, base: p.base, pool: p.pool, side: p.side, size: p.size, entry: p.entry, liq: p.liq, mark: p.mark });
+    }
+    for (const [k, w] of [...this.watchHeld]) {
+      if (w.addr === a && !seen.has(w.base)) { this.watchHeld.delete(k); await this.watchEnded(k, w); }
+    }
+  }
+
+  /** A watched position closed, flipped or was liquidated: tell the watchers who were warned about it, once. */
+  private async watchEnded(k: string, w: WHeld): Promise<void> {
+    const ids = this.watchWarned.get(k);
+    this.watchWarned.delete(k);
+    for (const id of ids ?? []) {
+      this.lastWarn.delete(`w:${id}:${k}`);
+      const u = this.store.get(id);
+      if (!u || u.blockedAt || !u.watches?.some((x) => x.addr.toLowerCase() === w.addr)) continue;
+      await this.watchGone?.(u, w.addr, w.base, w.side).catch(() => {});
+    }
+  }
+
+  private forgetWatched(k: string): void {
+    this.watchHeld.delete(k);
+    for (const id of this.watchWarned.get(k) ?? []) this.lastWarn.delete(`w:${id}:${k}`);
+    this.watchWarned.delete(k);
+  }
+
   private syncSubs(): void {
-    const need = new Set([...this.held.values()].map((h) => h.pool.toLowerCase()));
+    const need = new Set([...this.held.values(), ...this.watchHeld.values()].map((h) => h.pool.toLowerCase()));
     for (const pool of need) if (!this.subs.has(pool)) void this.subscribe(pool);
     for (const [pool, s] of this.subs) if (!need.has(pool)) { this.subs.delete(pool); void s.unsubscribe?.().catch(() => {}); }
   }
@@ -172,6 +255,23 @@ export class Protector {
           this.lastWarn.set(key, Date.now());
           await this.warn(u, h.base, `${h.base}-PERP ${h.side}: mark ${fmtPrice(mark)} is only ${dist.toFixed(2)}% from your liquidation price ${fmtPrice(h.liq!)}.`).catch(() => {});
         }
+      }
+    }
+    // Watched accounts: warnings only. `act` is never called for them.
+    for (const [k, w] of this.watchHeld) {
+      if (w.pool.toLowerCase() !== pool) continue;
+      w.mark = mark;
+      const dist = liqDistancePct(w.side, mark, w.liq);
+      if (dist === undefined) continue;
+      for (const u of this.store.watchersOf(w.addr)) {
+        if (u.blockedAt || u.owner?.toLowerCase() === w.addr || dist > u.liqWarnPct) continue;
+        const ck = `w:${u.id}:${k}`;
+        if (Date.now() - (this.lastWarn.get(ck) ?? 0) <= LIMITS.liqWarnCooldownMs) continue;
+        this.lastWarn.set(ck, Date.now());
+        let ids = this.watchWarned.get(k);
+        if (!ids) this.watchWarned.set(k, (ids = new Set()));
+        ids.add(u.id);
+        await this.watchWarn?.(u, w.addr, w.base, `${w.base}-PERP ${w.side}, mark ${fmtPrice(mark)} is ${dist.toFixed(1)}% from liquidation ${fmtPrice(w.liq!)}`).catch(() => {});
       }
     }
   }

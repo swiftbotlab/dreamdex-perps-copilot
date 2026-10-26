@@ -1,16 +1,19 @@
 // Perps Copilot: Telegram front end. Long polling, per-user serial queues, per-user rate limits,
 // one global cap on concurrent transactions. User text is parsed by src/parse.ts only; nothing
 // user-supplied reaches a shell, an eval, a file path or an SVG without validation.
+import { randomBytes } from "node:crypto";
 import { getAddress } from "viem";
-import { APP_URL, CHAIN_NAME, EXPLORER_ADDR, EXPLORER_TX, LIMITS, PATHS } from "./config.ts";
+import { APP_URL, CHAIN_NAME, DEMO_ACCOUNT, EXPLORER_ADDR, EXPLORER_TX, LIMITS, PATHS } from "./config.ts";
 import { renderCard } from "./card.ts";
+import { acquireInstanceLock } from "./instance.ts";
 import { KeyVault } from "./keys.ts";
-import { checkVsMark, cleanBase, escapeHtml as h, fmtPrice, fmtUsd, isAddress, liqDistancePct, parseAmount, parseLevel, parseOpen, resolveLevel, splitCommand, type Side } from "./parse.ts";
+import { KeyedLock, Semaphore } from "./locks.ts";
+import { checkVsMark, cleanBase, escapeHtml as h, fmtPrice, fmtUsd, isAddress, liqDistancePct, parseAmount, parseLevel, parseOpen, resolveLevel, splitCommand, type OpenCmd, type Side } from "./parse.ts";
 import { Protector } from "./protect.ts";
 import { readEnvFile } from "./secrets.ts";
-import { Store, type User } from "./store.ts";
+import { autoKind, Store, type CardRec, type OrderRow, type User } from "./store.ts";
 import { Telegram, type Button, type TgCallback, type TgMessage, type TgUpdate } from "./tg.ts";
-import { findLinkedOwners, UserError, Venue, type Position, type TradeResult } from "./venue.ts";
+import { findLinkedOwners, OutcomeUnknown, UserError, Venue, type AccountView, type Position, type TradeResult } from "./venue.ts";
 
 const log = (...a: unknown[]) => console.log(new Date().toISOString(), ...a);
 
@@ -30,36 +33,12 @@ class Bucket {
   }
 }
 
-/** One async lock per key: opens and closes of the same account+market never overlap. */
-class KeyedLock {
-  private tails = new Map<string, Promise<void>>();
-  async run<T>(key: string, f: () => Promise<T>): Promise<T> {
-    const prev = this.tails.get(key) ?? Promise.resolve();
-    let release!: () => void;
-    const mine = new Promise<void>((r) => { release = r; });
-    const tail = prev.then(() => mine);
-    this.tails.set(key, tail);
-    await prev;
-    try { return await f(); } finally { release(); if (this.tails.get(key) === tail) this.tails.delete(key); }
-  }
-}
-
-class Semaphore {
-  private active = 0;
-  private waiters: (() => void)[] = [];
-  constructor(private max: number) {}
-  async run<T>(f: () => Promise<T>): Promise<T> {
-    if (this.active >= this.max) {
-      if (this.waiters.length >= 50) throw new UserError("The bot is busy right now. Try again in a minute.");
-      await new Promise<void>((r) => this.waiters.push(r));
-    }
-    this.active++;
-    try { return await f(); } finally { this.active--; this.waiters.shift()?.(); }
-  }
-}
+/** A card-copy preview waiting for its Confirm button. In memory only; each one can be used once. */
+interface Draft { uid: number; owner: string; card: string; base: string; side: Side; margin: number; lev: number; exp: number }
 
 const txLink = (hash: string) => `<a href="${EXPLORER_TX}${hash}">${hash.slice(0, 10)}…${hash.slice(-6)}</a>`;
 const addrLink = (a: string) => `<a href="${EXPLORER_ADDR}${a}">${a.slice(0, 8)}…${a.slice(-6)}</a>`;
+const BLOCKED_RE = /blocked by the user|user is deactivated|chat not found/i;
 
 export class Bot {
   private tg: Telegram;
@@ -69,12 +48,17 @@ export class Bot {
   private protector: Protector;
   private me = "";
   private buckets = new Bucket();
-  private txs = new Semaphore(LIMITS.maxConcurrentTx);
-  private autoTxs = new Semaphore(2);                 // auto-closes never queue behind other users' opens
+  private txs = new Semaphore(LIMITS.maxConcurrentTx, () => new UserError("The bot is busy right now. Try again in a minute."));
+  private autoTxs = new Semaphore(2, () => new UserError("The bot is busy right now. Try again in a minute.")); // auto-closes never queue behind other users' opens
   private posLock = new KeyedLock();
   private recentClose = new Map<string, { prevSize: number; at: number }>();
   private pending = new Map<number, number>();
   private queues = new Map<number, Promise<void>>();
+  private drafts = new Map<string, Draft>();
+  private tapped = new Set<string>();                 // `${card}:${telegramId}`: a tap counts once per process
+  private demoAccount: `0x${string}` = DEMO_ACCOUNT;
+  private demoCache?: { account: string; at: number; view: AccountView; orders: OrderRow[]; totals: ReturnType<Store["orderTotals"]> };
+  private releaseLock?: () => void;
   private stopping = false;
 
   constructor() {
@@ -84,15 +68,32 @@ export class Bot {
     this.vault = new KeyVault(master.DDMVP_MASTER_KEY ?? "");
     this.store = new Store(PATHS.data);
     this.protector = new Protector(this.venue, this.store, (u, b, f, r, o) => this.autoClose(u, b, f, r, o), (u, b, t) => this.liqWarn(u, b, t), log);
+    this.protector.onWatch((u, a, b, t) => this.watchWarn(u, a, b, t), (u, a, b, s) => this.watchGone(u, a, b, s));
   }
 
   async start(): Promise<void> {
+    // First, before any chain or Telegram traffic: one instance only (exit 3 = systemd retries in 15 s).
+    try {
+      this.releaseLock = acquireInstanceLock(PATHS.data, {
+        beatMs: 5_000, staleMs: 12_000,
+        onLost: () => { log("instance lock lost (another instance took it): exiting"); process.exit(3); },
+      });
+    } catch (e) {
+      log("instance lock refused:", String(e instanceof Error ? e.message : e).slice(0, 200));
+      process.exit(3);
+    }
+    log("instance lock acquired");
+    const stop = () => { this.stopping = true; this.protector.stop(); this.releaseLock?.(); };
+    process.on("SIGTERM", stop);
+    process.on("SIGINT", stop);
     await this.venue.init();
     const me = await this.tg.getMe();
     this.me = me.username ?? "";
     log("started as", this.me, "markets", this.venue.list().length, "users", this.store.count());
     await this.tg.setMyCommands([
       { command: "start", description: "Set up: link your bot key" },
+      { command: "demo", description: "See a live account, no wallet needed" },
+      { command: "watch", description: "Liquidation pings for any account" },
       { command: "long", description: "Open long: /long ETH 20 5x" },
       { command: "short", description: "Open short: /short BTC 20 3x" },
       { command: "close", description: "Close: /close ETH [50%]" },
@@ -100,6 +101,7 @@ export class Bot {
       { command: "tp", description: "Take-profit: /tp ETH 2500 or 4%" },
       { command: "sl", description: "Stop-loss: /sl ETH 2300 or 2%" },
       { command: "card", description: "Share a PnL card" },
+      { command: "invite", description: "Your invite link and card stats" },
       { command: "alerts", description: "Liquidation warning distance" },
       { command: "guard", description: "Auto-close near liquidation" },
       { command: "markets", description: "Markets and marks" },
@@ -107,20 +109,22 @@ export class Bot {
       { command: "help", description: "How it works" },
     ]).catch((e) => log("setMyCommands", String(e)));
     await this.tg.setDescription(
-      "Trade dreamDEX perps on Somnia Tokyo testnet from Telegram. Market orders with size and leverage, positions with PnL, take-profit / stop-loss that close for you, liquidation alerts, and PnL cards to share. Your account stays yours: you link a trading key that can place orders but can never withdraw.",
-      "dreamDEX perps from Telegram: orders, TP/SL, liquidation alerts, PnL cards. Testnet.",
+      "Trade dreamDEX perps on Somnia Tokyo testnet from Telegram. Market orders with size and leverage, positions with PnL, take-profit / stop-loss that close for you, liquidation alerts, and PnL cards friends can copy. Try /demo first, no wallet needed. Your account stays yours: you link a trading key that can place orders but can never withdraw.",
+      "dreamDEX perps from Telegram: orders, TP/SL, liquidation alerts, copyable PnL cards. Testnet.",
     ).catch((e) => log("setDescription", String(e)));
     this.protector.start();
     setInterval(() => {
       this.buckets.prune(3_600_000);
       for (const [k, v] of this.recentClose) if (Date.now() - v.at > 60_000) this.recentClose.delete(k);
+      for (const [k, d] of this.drafts) if (d.exp <= Date.now()) this.drafts.delete(k);
       const n = this.store.pruneUnlinked(48 * 3_600_000);
       if (n) log("pruned unlinked users", n);
+      const c = this.store.pruneCards();
+      if (c) log("pruned old cards", c);
     }, 10 * 60_000).unref();
-    process.on("SIGTERM", () => { this.stopping = true; });
-    process.on("SIGINT", () => { this.stopping = true; });
     await this.poll();
     this.protector.stop();
+    this.releaseLock?.();
     log("stopped");
   }
 
@@ -131,6 +135,7 @@ export class Bot {
       try {
         const updates = await this.tg.getUpdates(offset);
         backoff = 1_000;
+        if (this.stopping) break; // not confirmed: the next instance receives these updates
         for (const u of updates) {
           offset = u.update_id + 1;
           this.dispatch(u);
@@ -149,6 +154,8 @@ export class Bot {
     if (!from || from.is_bot) return;
     if (u.message && u.message.chat.type !== "private") return; // private chats only
     if (u.callback_query && u.callback_query.message && u.callback_query.message.chat.type !== "private") return;
+    const known = this.store.get(from.id);
+    if (known?.blockedAt) { delete known.blockedAt; this.store.save(); } // they are talking to us again
     // Flood control happens BEFORE anything is queued: over-limit updates are dropped, and each user
     // may have at most 5 updates waiting.
     if (!this.buckets.allow(`cmd:${from.id}`, LIMITS.cmdPerMinute, 60_000)) {
@@ -187,8 +194,20 @@ export class Bot {
     if (cmd === "start") return this.cmdStart(id, chat, args[0]);
     if (cmd === "help") return this.cmdHelp(chat);
     if (cmd === "markets") return this.cmdMarkets(chat);
+    if (cmd === "demo") return this.cmdDemo(id, chat);
+    if (cmd === "watch" || cmd === "unwatch") {
+      // No link needed: watching only reads public chain state. A record is made for the watch list.
+      const existing = this.store.get(id);
+      if (!existing && !args[0]) {
+        await this.say(chat, cmd === "watch" ? this.watchUsage(LIMITS.defaultLiqWarnPct) : "You watch no accounts.");
+        return;
+      }
+      const r = existing ? { user: existing } : await this.ensureUser(id, chat);
+      if (!r) return;
+      return cmd === "watch" ? this.cmdWatch(r.user, chat, args[0]) : this.cmdUnwatch(r.user, chat, args[0]);
+    }
     const user = this.store.get(id);
-    if (!user) { await this.say(chat, "Send /start first to get your personal bot key."); return; }
+    if (!user) { await this.say(chat, "Send /start first to get your personal bot key, or /demo to look around."); return; }
     switch (cmd) {
       case "key": return this.cmdKey(user, chat);
       case "link": return this.cmdLink(user, chat, args[0]);
@@ -201,40 +220,83 @@ export class Bot {
       case "alerts": return this.cmdAlerts(user, chat, args[0]);
       case "guard": return this.cmdGuard(user, chat, args[0]);
       case "card": return this.cmdCard(user, chat, args[0]);
+      case "invite": return this.cmdInvite(user, chat);
       default: await this.say(chat, "Unknown command. /help lists them.");
     }
   }
 
+  /** Send a message. If Telegram says the user blocked the bot (or the chat is gone), mark them so pings stop. */
   private say(chat: number, html: string, buttons?: Button[][]) {
-    return this.tg.sendMessage(chat, html, buttons).catch((e) => log("send failed", String(e).slice(0, 120)));
+    return this.tg.sendMessage(chat, html, buttons).catch((e) => {
+      const msg = String(e instanceof Error ? e.message : e);
+      log("send failed", msg.slice(0, 120));
+      if (BLOCKED_RE.test(msg)) {
+        const u = this.store.get(chat); // private chats only: the chat id is the user id
+        if (u && !u.blockedAt) { u.blockedAt = Date.now(); this.store.save(); }
+      }
+    });
   }
 
   // ---------- onboarding ----------
+  /** Create the user record (and their bot key) if it does not exist yet, within the sign-up caps. */
+  private async ensureUser(id: number, chat: number, refBy?: string, via = "direct"): Promise<{ user: User; created: boolean } | undefined> {
+    const existing = this.store.get(id);
+    if (existing) return { user: existing, created: false };
+    if (this.store.count() >= LIMITS.maxUsers) { await this.say(chat, "The testnet beta is full right now. Please try again later."); return undefined; }
+    if (this.store.keysMadeLastHour() >= LIMITS.newKeysPerHour) { await this.say(chat, "Lots of sign-ups this hour. Please try again in a few minutes."); return undefined; }
+    const { address, sealed } = this.vault.create(id);
+    const user = this.store.add({ id, created: Date.now(), keyAddress: address, key: sealed, refBy });
+    log("new user", refBy ? via : "direct", "total", this.store.count());
+    return { user, created: true };
+  }
+
   private async cmdStart(id: number, chat: number, payload?: string): Promise<void> {
-    let user = this.store.get(id);
-    if (!user) {
-      if (this.store.count() >= LIMITS.maxUsers) { await this.say(chat, "The testnet beta is full right now. Please try again later."); return; }
-      if (this.store.keysMadeLastHour() >= LIMITS.newKeysPerHour) { await this.say(chat, "Lots of sign-ups this hour. Please try again in a few minutes."); return; }
-      const refBy = payload && /^r_[0-9a-f]{10}$/.test(payload) && this.store.byRef(payload.slice(2)) ? payload.slice(2) : undefined;
-      const { address, sealed } = this.vault.create(id);
-      user = this.store.add({ id, created: Date.now(), keyAddress: address, key: sealed, refBy });
-      log("new user", refBy ? "via share link" : "direct", "total", this.store.count());
+    const card = payload && /^c_[0-9a-f]{10}$/.test(payload) ? this.store.card(payload.slice(2)) : undefined;
+    let refBy: string | undefined;
+    if (card) {
+      const sharer = this.store.get(card.by);
+      if (sharer && sharer.id !== id) refBy = sharer.ref;
+    } else if (payload && /^r_[0-9a-f]{10}$/.test(payload) && this.store.byRef(payload.slice(2))) {
+      refBy = payload.slice(2);
+    }
+    const r = await this.ensureUser(id, chat, refBy, card ? "via card" : "via share link");
+    if (!r) return;
+    const user = r.user;
+    if (card) {
+      if (card.by !== id) { // the sharer's own taps change no counters and send no ping
+        const tapKey = `${card.id}:${id}`;
+        if (!this.tapped.has(tapKey)) {
+          if (this.tapped.size >= LIMITS.tapsTracked) this.tapped.clear();
+          this.tapped.add(tapKey);
+          card.taps++;
+        }
+        if (r.created) card.newUsers++;
+        this.store.save();
+        if (r.created) await this.pingSharer(card, `🎉 Your ${card.base} card brought a new trader to Perps Copilot.`);
+      }
+      if (user.owner) { await this.cardLanding(user, chat, card); return; }
+      user.pendingCopy = { card: card.id, at: Date.now() };
+      this.store.save();
+      await this.cardLanding(user, chat, card);
     }
     const linked = user.owner ? `\n\nLinked account: ${addrLink(user.owner)}. Try <code>/long ETH 20 5x</code> or /positions.` : "";
     await this.say(chat,
+      `Look around first, no wallet needed: /demo (a live account run by this bot) · <code>/watch 0xYourAccount</code> (liquidation pings)\n\n` +
       `<b>Perps Copilot</b> trades dreamDEX perps on ${CHAIN_NAME} for you, right here in Telegram.\n\n` +
-      `<b>How the bot gets permission</b>\nYou never share your wallet. I made you a personal <b>bot key</b>:\n<code>${user.keyAddress}</code>\n\n` +
-      `1. Open <a href="${APP_URL}">app.testnet.dreamdex.io</a>, open your wallet, choose <b>Link a bot</b>.\n` +
-      `2. Paste the address above, keep <b>Perps</b> ticked, press <b>Add bot</b>. Let the app send it a little STT for gas.\n` +
-      `3. Make sure your <b>Perps</b> balance has USDso (Perps ⇆ Spot in the app; Perps Arena paper USDso works).\n` +
-      `4. Press <b>I've linked it</b> below.\n\n` +
-      `A linked key can place, cancel and close orders for your account. It <b>cannot withdraw or move funds</b>, and you can remove it in the app at any time.` + linked,
+      `<b>To trade, link your personal bot key</b> (you never share your wallet):\n<code>${user.keyAddress}</code>\n` +
+      `1. In <a href="${APP_URL}">app.testnet.dreamdex.io</a> open your wallet, <b>Link a bot</b>.\n` +
+      `2. Paste the address, keep <b>Perps</b> ticked, <b>Add bot</b> (let the app send it a little STT for gas).\n` +
+      `3. Keep USDso in your <b>Perps</b> balance (Perps Arena paper USDso works).\n` +
+      `4. Press <b>I've linked it</b>.\n\n` +
+      `The key can place and close orders for your account. It <b>cannot withdraw or move funds</b>; remove it in the app any time.` + linked,
       [[{ text: "Open dreamDEX", url: APP_URL }], [{ text: "I've linked it", callback_data: "chk" }]]);
   }
 
   private async cmdHelp(chat: number): Promise<void> {
     await this.say(chat,
       `<b>Commands</b>\n` +
+      `/demo  a live account run by this bot (no wallet needed)\n` +
+      `<code>/watch 0xAccount</code>  liquidation pings for any account, read only (/unwatch)\n` +
       `<code>/long ETH 20 5x</code> market long: 20 USDso margin at 5x = 100 USDso position\n` +
       `<code>/short BTC 15 10x tp 3% sl 1.5%</code> short with take-profit and stop-loss\n` +
       `<code>/close ETH</code> or <code>/close ETH 50%</code>\n` +
@@ -242,8 +304,9 @@ export class Bot {
       `<code>/tp ETH 2500</code>, <code>/sl ETH 2%</code>, <code>/tp ETH off</code>  bot-watched exits\n` +
       `<code>/alerts 10</code> warn when within 10% of liquidation\n` +
       `<code>/guard 3</code> auto-close when within 3% (<code>/guard off</code>)\n` +
-      `/card  PnL card to share   /markets   /status   /key\n\n` +
-      `<b>How protection works</b>: the bot follows every market you hold through Somnia Reactivity (mark price pushed by the chain about once a second) and closes for you when your TP, SL or guard level is reached. It runs while the bot runs; it is not an on-chain stop order.\n\n` +
+      `/card  PnL card friends can copy · /invite  your link and card stats\n` +
+      `/markets   /status   /key\n\n` +
+      `<b>How protection works</b>: the bot follows every market you hold through Somnia Reactivity (the chain pushes the mark price on each pool event that changes the mark, measured about once a second) and closes for you when your TP, SL or guard level is reached. It runs while the bot runs; it is not an on-chain stop order.\n\n` +
       `Testnet only (${CHAIN_NAME}). Not financial advice.`);
   }
 
@@ -269,6 +332,11 @@ export class Bot {
       await this.say(chat, `The bot key is not linked to ${addrLink(owner)} yet. In the app: wallet, <b>Link a bot</b>, paste <code>${u.keyAddress}</code>, keep Perps ticked, Add bot. Then press the button again.`, [[{ text: "I've linked it", callback_data: "chk" }]]);
       return;
     }
+    if (u.owner && u.owner.toLowerCase() !== owner.toLowerCase()) {
+      // A TP/SL, an open record or a pending copy set on the old account must never act on the new one.
+      u.rules = {}; u.opens = {}; delete u.lastClosed; delete u.pendingCopy;
+      log("relink: cleared per-account state");
+    }
     u.owner = owner; this.venue.forgetKey(u.id); this.store.save();
     const [acct, gas] = await Promise.all([this.venue.account(owner), this.venue.gasBalance(u.keyAddress)]);
     await this.protector.refreshUser(u).catch(() => {});
@@ -279,10 +347,17 @@ export class Bot {
       (acct.equity <= 0 ? "Your Perps balance is empty: move USDso Spot -> Perps in the app first.\n" : "") +
       (gas < LIMITS.lowGasStt ? "Gas is low: the key needs STT to send orders.\n" : "") +
       `\nTry <code>/long ETH 20 5x</code>.`);
+    const pc = u.pendingCopy;
+    if (pc) {
+      delete u.pendingCopy; this.store.save();
+      const card = Date.now() - pc.at < LIMITS.pendingCopyTtlMs ? this.store.card(pc.card) : undefined;
+      if (card) await this.cardLanding(u, chat, card);
+    }
   }
 
   private async cmdUnlink(u: User, chat: number): Promise<void> {
-    delete u.owner; u.rules = {}; this.venue.forgetKey(u.id); this.store.save();
+    delete u.owner; u.rules = {}; u.opens = {}; delete u.lastClosed; delete u.pendingCopy;
+    this.venue.forgetKey(u.id); this.store.save();
     await this.protector.refreshUser(u).catch(() => {});
     await this.say(chat, "Unlinked here: no more orders or protection. To revoke the key on chain too, remove the bot in the app's Link a bot screen.");
   }
@@ -311,6 +386,58 @@ export class Bot {
       `Liquidation warning: within ${u.liqWarnPct}% · guard: ${u.guardPct ? `auto-close within ${u.guardPct}%` : "off"}\n` +
       (rules ? `<b>Watched exits</b>\n${h(rules)}\n` : "") +
       `Somnia Reactivity: ${w.length} live mark stream${w.length === 1 ? "" : "s"}${w.length ? ` (${w.map((x) => `${x.base} ${x.pushes} pushes`).join(", ")})` : ""}`);
+  }
+
+  // ---------- /demo: a live account, no wallet needed ----------
+  private async demoData() {
+    const account = this.demoAccount;
+    const c = this.demoCache;
+    if (c && c.account === account && Date.now() - c.at < LIMITS.demoCacheMs) return c;
+    const view = await this.venue.account(account);
+    const fresh = { account, at: Date.now(), view, orders: this.store.recentOrders(account, 5), totals: this.store.orderTotals(account) };
+    this.demoCache = fresh;
+    return fresh;
+  }
+
+  private orderLine(r: OrderRow): string {
+    const auto = autoKind(r.reason);
+    const tag = r.kind === "unknown" ? "outcome not confirmed at send" : auto ? `auto: ${auto}` : r.reason ? h(r.reason.slice(0, 40)) : "";
+    const fill = r.filled !== undefined ? ` ${r.filled}${r.avgPrice !== undefined ? ` @ ${fmtPrice(r.avgPrice)}` : ""}` : "";
+    return `${r.t.slice(5, 16).replace("T", " ")} ${r.kind} ${r.market} ${r.side}${fill}${tag ? ` · ${tag}` : ""}${r.via === "card" ? " · card copy" : ""} · ${txLink(r.hash)}`;
+  }
+
+  private async cmdDemo(id: number, chat: number): Promise<void> {
+    if (!this.buckets.allow(`demo:${id}`, LIMITS.demoPerMinute, 60_000)) { await this.say(chat, "One moment: /demo works a few times a minute."); return; }
+    const d = await this.demoData();
+    const pos = d.view.positions.map((p) => {
+      const dist = liqDistancePct(p.side, p.mark, p.liq);
+      return `${p.base}-PERP ${p.side} ${p.size} · entry ${fmtPrice(p.entry)} · mark ${fmtPrice(p.mark)} · PnL ${fmtUsd(p.upnl, true)}${dist !== undefined ? ` · ${dist.toFixed(1)}% from liquidation` : ""}`;
+    });
+    const t = d.totals;
+    const w = this.protector.watching();
+    await this.say(chat,
+      `<b>Live demo</b>: a dreamDEX account this bot trades for on ${CHAIN_NAME} (paper USDso), through a bot key linked with Link a bot.\n` +
+      `Account ${addrLink(d.account)} · equity ${fmtUsd(d.view.equity)} USDso\n` +
+      (pos.length ? `${pos.join("\n")}\n` : "No open positions right now.\n") +
+      (d.orders.length ? `\n<b>Last bot orders</b>\n${d.orders.map((r) => this.orderLine(r)).join("\n")}\n` : "") +
+      (t.lastAuto ? `\n<b>Last auto-exit</b>: ${t.lastAuto.t.slice(5, 16).replace("T", " ")} UTC ${t.lastAuto.market} ${autoKind(t.lastAuto.reason)} · ${txLink(t.lastAuto.hash)}\n` : "") +
+      `\n<b>Totals</b>: ${t.orders} orders (${t.opens} opens, ${t.closes} closes), ${t.autoExits} closed by the bot itself (take-profit, stop-loss or guard)${t.unknown ? `, ${t.unknown} not confirmed at send` : ""}.\n` +
+      `<b>Somnia Reactivity</b>: ${w.length} live mark stream${w.length === 1 ? "" : "s"}${w.length ? ` (${w.map((x) => `${x.base} ${x.pushes} pushes`).join(", ")})` : ""}.`,
+      [[{ text: "Sample PnL card", callback_data: "dc" }], [{ text: "Watch this account", callback_data: "wd" }], [{ text: "Start trading", callback_data: "st" }]]);
+  }
+
+  private async demoCard(viewer: number, chat: number): Promise<void> {
+    if (!this.buckets.allow(`card:${viewer}`, LIMITS.cardsPerMinute, 60_000)) { await this.say(chat, "One moment: card limit reached, try again in a minute."); return; }
+    const demo = this.demoAccount.toLowerCase();
+    const du = this.store.all().find((x) => x.owner?.toLowerCase() === demo);
+    let rec = du ? this.store.cardsBy(du.id)[0] : undefined;
+    if (!rec && du?.lastClosed) {
+      const c = du.lastClosed;
+      rec = this.store.addCard({ by: du.id, base: c.base, side: c.side, lev: du.opens[c.base]?.leverage, entry: c.entry, price: c.exit, pnl: c.pnl, open: false, at: Date.now(), tradeAt: c.at });
+      this.store.save();
+    }
+    if (!rec) { await this.say(chat, "No sample card yet."); return; }
+    await this.sendCard(chat, rec, "Sample card from the demo account.");
   }
 
   // ---------- trading ----------
@@ -355,7 +482,7 @@ export class Bot {
     await this.posLock.run(`${tk.owner.toLowerCase()}:${p.base}`, () => this.openLocked(u, chat, side, p, tk));
   }
 
-  private async openLocked(u: User, chat: number, side: Side, p: Exclude<ReturnType<typeof parseOpen>, string>, tk: ReturnType<Bot["tk"]>): Promise<void> {
+  private async openLocked(u: User, chat: number, side: Side, p: OpenCmd, tk: ReturnType<Bot["tk"]>, opts: { maxTouchPct?: number; via?: "card"; card?: string } = {}): Promise<TradeResult | undefined> {
     const m = this.venue.market(p.base)!;
     const [cap, acct] = await Promise.all([this.venue.accountCap(tk.owner, m), this.venue.account(tk.owner)]);
     if (cap > 0 && p.leverage > cap) throw new UserError(`Your account caps ${p.base}-PERP at ${cap}x (set in the app). Use ${cap}x or less, or raise it in the app.`);
@@ -365,10 +492,18 @@ export class Bot {
     const notional = p.margin * p.leverage;
     const minN = this.venue.minNotional(p.base);
     if (minN && notional < minN * 1.02) throw new UserError(`Too small: the minimum ${p.base}-PERP order is about ${(minN * 1.02).toFixed(2)} USDso notional (margin x leverage).`);
+    const extra = opts.via ? { via: opts.via, card: opts.card } : undefined;
     await this.say(chat, `Sending ${side} ${p.base}-PERP, ${fmtUsd(notional)} USDso (${fmtUsd(p.margin)} x ${p.leverage}x), market order…`);
-    const r = await this.txs.run(() => this.venue.open(tk, p.base, side, notional));
-    this.record(u, "open", r);
-    if (r.filledBase === 0) { await this.say(chat, `Nothing filled (the book moved). Tx ${txLink(r.hash)}. No position was opened.`); return; }
+    let r: TradeResult;
+    try {
+      r = await this.txs.run(() => this.venue.open(tk, p.base, side, notional, { maxTouchPct: opts.maxTouchPct }));
+    } catch (e) {
+      // Maybe on chain: log it so evidence/ re-verifies it from the receipt. It is never resent.
+      if (e instanceof OutcomeUnknown) this.record(u, "unknown", { base: p.base, side, hash: e.hash }, undefined, { intent: "open", ...extra });
+      throw e;
+    }
+    this.record(u, "open", r, undefined, extra);
+    if (r.filledBase === 0) { await this.say(chat, `Nothing filled (the book moved). Tx ${txLink(r.hash)}. No position was opened.`); return r; }
     u.opens[p.base] = existing ? { margin: (u.opens[p.base]?.margin ?? 0) + p.margin, leverage: p.leverage, at: Date.now() } : { margin: p.margin, leverage: p.leverage, at: Date.now() };
     const notes: string[] = [];
     const ref = r.avgPrice ?? 0;
@@ -391,6 +526,7 @@ export class Bot {
       (pos ? `Position: ${pos.side} ${pos.size} ${p.base}, entry ${fmtPrice(pos.entry)}${pos.liq ? `, liquidation ${fmtPrice(pos.liq)}` : ""}\n` : "") +
       (notes.length ? h(notes.join(" · ")) + "\n" : `Add exits: <code>/tp ${p.base} 4%</code> <code>/sl ${p.base} 2%</code>\n`),
       [[{ text: `Close ${p.base}`, callback_data: `cl:${p.base}:100` }, { text: "PnL card", callback_data: `cd:${p.base}` }]]);
+    return r;
   }
 
   private async cmdClose(u: User, chat: number, args: string[]): Promise<void> {
@@ -411,8 +547,10 @@ export class Bot {
     return this.posLock.run(key, async () => {
       await this.gasCheck(u);
       let sideChanged = false;
+      let read: { abs: number; side: Side } | undefined;
       // Runs inside venue.close right after the fresh position read, before anything is sent.
       const guard = (abs: number, side: Side) => {
+        read = { abs, side };
         if (opt.expectSide && side !== opt.expectSide) {
           sideChanged = true;
           throw new UserError(`Your ${base}-PERP position is now a ${side}, not the ${opt.expectSide} this exit was set for. Nothing was sent, and the old ${base} exits were cleared.`);
@@ -427,6 +565,12 @@ export class Bot {
         r = await (opt.auto ? this.autoTxs : this.txs).run(() => this.venue.close(tk, base, fraction, opt.limit, guard));
       } catch (e) {
         if (sideChanged) { delete u.rules[base]; this.store.save(); }
+        if (e instanceof OutcomeUnknown) {
+          // The close may have gone through: block re-tries on the same size for 20 s; the next try reads the chain afresh.
+          this.recentClose.set(key, { prevSize: read?.abs ?? 0, at: Date.now() });
+          const side: Side = read?.side === "short" ? "long" : "short";
+          this.record(u, "unknown", { base, side, hash: e.hash }, reason, { intent: "close" });
+        }
         throw e;
       }
       if (r.filledBase > 0) this.recentClose.set(key, { prevSize: r.prevSize ?? Infinity, at: Date.now() });
@@ -459,9 +603,15 @@ export class Bot {
     } catch (e) {
       const msg = e instanceof UserError ? e.message : "chain error";
       log("auto-close failed", base, opt.kind, String(e instanceof Error ? e.message : e).slice(0, 200));
+      const key = `${u.id}:${base}:${opt.kind}`;
+      if (e instanceof OutcomeUnknown) {
+        if (this.buckets.allow(`autofail:${key}`, 1, 5 * 60_000)) {
+          await this.say(u.id, `⚠️ ${h(reason)}: the close order for ${base}-PERP ${e.hash ? `was sent (tx ${txLink(e.hash)})` : "may have reached the chain"} but its result is not confirmed yet. I re-read the position from the chain before any new attempt. Check /positions.`);
+        }
+        throw e;
+      }
       // A take-profit whose limit the book does not reach yet is not an error: retry quietly on the next pushes.
       const quiet = opt.kind === "tp" && /nothing would fill|thin/i.test(msg);
-      const key = `${u.id}:${base}:${opt.kind}`;
       if (!quiet && this.buckets.allow(`autofail:${key}`, 1, 5 * 60_000)) {
         await this.say(u.id, `⚠️ ${h(reason)}, but closing ${base}-PERP failed: ${h(msg)} I keep retrying while the level holds. You can also /close ${base}.`);
       }
@@ -473,9 +623,10 @@ export class Bot {
     await this.say(u.id, `⚠️ <b>Liquidation risk</b>\n${h(text)}`, [[{ text: "Close 50%", callback_data: `cl:${base}:50` }, { text: "Close all", callback_data: `cl:${base}:100` }]]);
   }
 
-  private record(u: User, kind: string, r: TradeResult, reason?: string): void {
+  /** Order log row: public on-chain facts plus public extras (`via`, `card`, `intent`). No Telegram ids. */
+  private record(u: User, kind: string, r: Partial<TradeResult> & { base: string; side: Side }, reason?: string, extra?: Record<string, string | undefined>): void {
     u.stats.orders++;
-    this.store.logOrder({ kind, reason, market: `${r.base}-PERP`, side: r.side, hash: r.hash, filled: r.filledBase, requested: r.requestedBase, avgPrice: r.avgPrice === undefined ? undefined : Number(r.avgPrice.toPrecision(10)), key: u.keyAddress, account: u.owner });
+    this.store.logOrder({ kind, reason, market: `${r.base}-PERP`, side: r.side, hash: r.hash, filled: r.filledBase, requested: r.requestedBase, avgPrice: r.avgPrice === undefined ? undefined : Number(r.avgPrice.toPrecision(10)), key: u.keyAddress, account: u.owner, ...extra });
   }
 
   private async cmdPositions(u: User, chat: number): Promise<void> {
@@ -525,7 +676,7 @@ export class Bot {
     const v = parseAmount(arg, 1, 50, 1);
     if (v === undefined) { await this.say(chat, `Liquidation warning is at ${u.liqWarnPct}%. Change it with <code>/alerts 10</code> (1-50).`); return; }
     u.liqWarnPct = v; this.store.save();
-    await this.say(chat, `I will warn you when the mark is within ${v}% of your liquidation price.`);
+    await this.say(chat, `I will warn you when the mark is within ${v}% of the liquidation price (your positions and the accounts you /watch).`);
   }
 
   private async cmdGuard(u: User, chat: number, arg?: string): Promise<void> {
@@ -536,37 +687,258 @@ export class Bot {
     await this.say(chat, `Guard on: I close a position when the mark gets within ${v}% of its liquidation price (warning at ${u.liqWarnPct}%).`);
   }
 
+  // ---------- cards and the copy loop ----------
   private async cmdCard(u: User, chat: number, arg?: string): Promise<void> {
     if (!this.buckets.allow(`card:${u.id}`, LIMITS.cardsPerMinute, 60_000)) { await this.say(chat, "One moment: card limit reached, try again in a minute."); return; }
     const want = cleanBase(arg);
     const acct = u.owner ? await this.venue.account(u.owner) : undefined;
     const p = acct?.positions.find((x) => !want || x.base === want);
-    let png: Uint8Array, caption: string;
+    let rec: CardRec;
     if (p) {
-      const lev = u.opens[p.base]?.leverage;
-      png = await renderCard({ base: p.base, side: p.side, leverage: lev, entry: p.entry, price: p.mark, pnl: p.upnl, open: true, spark: this.protector.sparkFor(p.base), botUsername: this.me, ref: u.ref, when: new Date() });
-      caption = `${p.base}-PERP ${p.side}${lev ? ` ${lev}x` : ""}: ${fmtUsd(p.upnl, true)} USDso open PnL on dreamDEX (${CHAIN_NAME}).`;
+      rec = this.store.addCard({ by: u.id, base: p.base, side: p.side, lev: u.opens[p.base]?.leverage, entry: p.entry, price: p.mark, pnl: p.upnl, open: true, at: Date.now() });
     } else if (u.lastClosed && (!want || u.lastClosed.base === want)) {
       const c = u.lastClosed;
-      png = await renderCard({ base: c.base, side: c.side, leverage: u.opens[c.base]?.leverage, entry: c.entry, price: c.exit, pnl: c.pnl, open: false, spark: this.protector.sparkFor(c.base), botUsername: this.me, ref: u.ref, when: new Date(c.at) });
-      caption = `${c.base}-PERP ${c.side} closed: ${fmtUsd(c.pnl, true)} USDso on dreamDEX (${CHAIN_NAME}).`;
+      rec = this.store.addCard({ by: u.id, base: c.base, side: c.side, lev: u.opens[c.base]?.leverage, entry: c.entry, price: c.exit, pnl: c.pnl, open: false, at: Date.now(), tradeAt: c.at });
     } else {
       await this.say(chat, "No position or recent close to put on a card yet.");
       return;
     }
     u.stats.cards++; this.store.save();
+    await this.sendCard(chat, rec);
+  }
+
+  /** The card image with its Copy this trade deep link (also printed on the image and in the caption). */
+  private async sendCard(chat: number, rec: CardRec, intro?: string): Promise<void> {
+    const png = await renderCard({
+      base: rec.base, side: rec.side, leverage: rec.lev, entry: rec.entry, price: rec.price, pnl: rec.pnl, open: rec.open,
+      spark: this.protector.sparkFor(rec.base), botUsername: this.me, start: `c_${rec.id}`, when: new Date(rec.tradeAt ?? rec.at),
+    });
+    const caption = rec.open
+      ? `${rec.base}-PERP ${rec.side}${rec.lev ? ` ${rec.lev}x` : ""}: ${fmtUsd(rec.pnl, true)} USDso open PnL on dreamDEX (${CHAIN_NAME}).`
+      : `${rec.base}-PERP ${rec.side}${rec.lev ? ` ${rec.lev}x` : ""} closed: ${fmtUsd(rec.pnl, true)} USDso on dreamDEX (${CHAIN_NAME}).`;
+    const link = `https://t.me/${this.me}?start=c_${rec.id}`;
+    await this.tg.sendPhoto(chat, png,
+      `${intro ? `${h(intro)}\n` : ""}${h(caption)}\nCopy this trade: ${link}\nForward this card. Friends tap Copy this trade to open the same trade on their own account.`,
+      [[{ text: "Copy this trade", url: link }]]);
+  }
+
+  /** Leverage for a copy: the card's (3x when it has none), at most the market maximum and `cardCopyMaxLev`. */
+  private copyLeverage(card: CardRec): { lev: number; note?: string } {
+    const cap = Math.max(1, Math.min(this.venue.maxLeverage(card.base) ?? 1, LIMITS.cardCopyMaxLev));
+    const want = card.lev ?? 3;
+    const lev = Math.min(Math.max(want, 1), cap);
+    if (card.lev === undefined) return { lev, note: `The card shows no leverage: using ${lev}x.` };
+    if (lev < want) return { lev, note: `Leverage capped at ${lev}x (the card used ${want}x; copies use at most ${cap}x on ${card.base}-PERP).` };
+    return { lev };
+  }
+
+  /** What a tapped card shows. Never the sharer's account or Telegram identity. */
+  private async cardLanding(u: User, chat: number, card: CardRec): Promise<void> {
+    const own = card.by === u.id;
+    const m = this.venue.market(card.base);
+    const mark = m ? await this.venue.mark(m).catch(() => undefined) : undefined;
+    const sharer = this.store.get(card.by);
+    const closedSince = card.open && !!sharer?.lastClosed && sharer.lastClosed.base === card.base && sharer.lastClosed.at > card.at;
+    const lines = [
+      own ? "<b>Your card: open it again</b>" : "<b>Shared trade</b>",
+      `${card.base}-PERP ${card.side}${card.lev ? ` ${card.lev}x` : ""} · entry ${fmtPrice(card.entry)} → ${card.open ? "mark" : "exit"} ${fmtPrice(card.price)} · ${fmtUsd(card.pnl, true)} USDso`,
+    ];
+    if (mark) {
+      const mv = ((mark - card.entry) / card.entry) * 100;
+      lines.push(`Mark now ${fmtPrice(mark)} (${mv >= 0 ? "+" : ""}${mv.toFixed(2)}% since entry)`);
+    }
+    if (!card.open || closedSince) lines.push(own ? "You have closed it." : "The sharer has closed it.");
+    if (!m) { lines.push(`${card.base}-PERP is not available right now.`); await this.say(chat, lines.join("\n")); return; }
+    if (!u.owner) {
+      lines.push("", "To copy it, link your bot key first (steps below). I show this trade again as soon as you are linked.");
+      await this.say(chat, lines.join("\n"));
+      return;
+    }
+    const { lev } = this.copyLeverage(card);
+    lines.push("", `Copy it on your own account: pick a margin. Other size: <code>/${card.side} ${card.base} 20 ${lev}x</code>`);
+    await this.say(chat, lines.join("\n"), [LIMITS.cardMargins.map((v) => ({ text: `${v} USDso`, callback_data: `cm:${card.id}:${v}` }))]);
+  }
+
+  /** `cm:` shows a preview and stores a single-use draft. It sends nothing, so replaying an old button is harmless. */
+  private async copyPreview(u: User, chat: number, cardId: string, margin: number): Promise<void> {
+    const card = this.store.card(cardId);
+    if (!card) { await this.say(chat, "That shared trade has expired. Ask for a fresh card."); return; }
+    const { owner } = this.requireLinked(u);
+    const m = this.venue.market(card.base);
+    if (!m) { await this.say(chat, `${card.base}-PERP is not available right now.`); return; }
+    const { lev, note } = this.copyLeverage(card);
+    const notional = margin * lev;
+    const minN = this.venue.minNotional(card.base);
+    if (minN && notional < minN * 1.02) throw new UserError(`Too small: the minimum ${card.base}-PERP order is about ${(minN * 1.02).toFixed(2)} USDso notional. Pick a larger size or send /${card.side} ${card.base} <margin> ${lev}x.`);
+    const mark = await this.venue.mark(m);
+    if (!mark) throw new UserError(`${card.base}-PERP has no fresh mark price right now. Nothing was sent.`);
+    const existing = (await this.venue.account(owner)).positions.find((x) => x.base === card.base);
+    if (existing && existing.side !== card.side) throw new UserError(`You hold a ${existing.side} on ${card.base}-PERP. Close it first with /close ${card.base} (a copy never flips a position).`);
+    const now = Date.now();
+    for (const [k, d] of this.drafts) if (d.exp <= now) this.drafts.delete(k);
+    while (this.drafts.size >= LIMITS.draftsMax) this.drafts.delete(this.drafts.keys().next().value!);
+    let nonce = randomBytes(6).toString("hex");
+    while (this.drafts.has(nonce)) nonce = randomBytes(6).toString("hex");
+    this.drafts.set(nonce, { uid: u.id, owner: owner.toLowerCase(), card: card.id, base: card.base, side: card.side, margin, lev, exp: now + LIMITS.draftTtlMs });
+    await this.say(chat,
+      `<b>Copy preview</b>\nOpen ${card.side} ${card.base} ${fmtUsd(margin)} x ${lev}x = ${fmtUsd(notional)} USDso at market (mark ${fmtPrice(mark)})${existing ? `; this adds to your ${card.base} ${existing.side}` : ""}.\n` +
+      (note ? `${h(note)}\n` : "") +
+      `Refused if the book is more than ${LIMITS.cardCopyMaxTouchPct}% from the mark. Confirm within ${Math.round(LIMITS.draftTtlMs / 60_000)} minutes; the button works once.`,
+      [[{ text: "Confirm", callback_data: `cx:${nonce}:0` }], [{ text: "Confirm + SL 3%", callback_data: `cx:${nonce}:1` }]]);
+  }
+
+  /** `cx:` takes the draft out before anything else (no await in between), so one preview sends at most one order. */
+  private async copyConfirm(u: User, chat: number, nonce: string, withSl: boolean): Promise<void> {
+    const d = this.drafts.get(nonce);
+    if (d && d.uid === u.id) this.drafts.delete(nonce);
+    if (!d || d.uid !== u.id || Date.now() > d.exp) {
+      await this.say(chat, "That confirmation has expired or was already used. Open the shared card again to copy it.");
+      return;
+    }
+    this.tradeAllowed(u);
+    const tk = this.tk(u);
+    if (tk.owner.toLowerCase() !== d.owner) { await this.say(chat, "Your linked account changed since the preview. Open the shared card again."); return; }
+    if (!this.venue.market(d.base)) { await this.say(chat, `${d.base}-PERP is not available right now.`); return; }
+    const p: OpenCmd = { kind: "open", side: d.side, base: d.base, margin: d.margin, leverage: d.lev, sl: withSl ? { pct: 3 } : undefined };
+    const r = await this.posLock.run(`${tk.owner.toLowerCase()}:${d.base}`, () =>
+      this.openLocked(u, chat, d.side, p, tk, { maxTouchPct: LIMITS.cardCopyMaxTouchPct, via: "card", card: d.card }));
+    if (r && r.filledBase > 0) {
+      const card = this.store.card(d.card);
+      if (card && card.by !== u.id) {
+        card.copies++; this.store.save();
+        await this.pingSharer(card, `🔁 Your ${card.base} ${card.side} card was copied (${fmtUsd(d.margin)} USDso x ${d.lev}x).`);
+      }
+    }
+  }
+
+  /** Attribution ping to a card's sharer: skipped when they are gone or blocked the bot; at most `pingsPerHour`. */
+  private async pingSharer(card: CardRec, html: string): Promise<void> {
+    const s = this.store.get(card.by);
+    if (!s || s.blockedAt) return;
+    if (!this.buckets.allow(`ping:${s.id}`, LIMITS.pingsPerHour, 3_600_000)) return; // counts still show in /invite
+    await this.say(s.id, html);
+  }
+
+  private async cmdInvite(u: User, chat: number): Promise<void> {
     const link = `https://t.me/${this.me}?start=r_${u.ref}`;
-    await this.tg.sendPhoto(chat, png, `${h(caption)}\nTrade perps from Telegram: ${link}\nForward this card to share it.`, [[{ text: "Trade with Perps Copilot", url: link }]]);
+    const since = Date.now() - LIMITS.cardTtlMs;
+    const cards = this.store.cardsBy(u.id).filter((c) => c.at >= since);
+    const sum = (k: "taps" | "newUsers" | "copies") => cards.reduce((a, c) => a + c[k], 0);
+    await this.say(chat,
+      `<b>Your invite link</b>\n${link}\nTraders who joined through your links and cards: ${this.store.refCount(u.ref)}\n\n` +
+      `<b>Your cards, last 30 days</b>\nCards made: ${cards.length} · taps: ${sum("taps")} · new traders: ${sum("newUsers")} · copies: ${sum("copies")}\n\n` +
+      `Make a card with /card and forward it: friends tap <b>Copy this trade</b> to open the same trade on their own account.`);
+  }
+
+  // ---------- /watch: read-only liquidation pings for any account ----------
+  private watchUsage(pct: number): string {
+    return `<code>/watch 0xAccount</code> sends you a warning when a position on that dreamDEX account gets within ${pct}% of liquidation (change it with /alerts). ` +
+      `Read only: no link, no key, no trading. Up to ${LIMITS.watchesPerUser} accounts; /unwatch removes one.`;
+  }
+
+  private watchSummary(addr: string, view: { equity?: number; positions: { base: string; side: Side; size: number; mark?: number; liq?: number }[] }): string {
+    const head = `${addrLink(addr)}${view.equity !== undefined ? ` · equity ${fmtUsd(view.equity)} USDso` : ""}`;
+    if (!view.positions.length) return `${head}\nno open positions`;
+    return `${head}\n` + view.positions.map((p) => {
+      const d = p.mark !== undefined ? liqDistancePct(p.side, p.mark, p.liq) : undefined;
+      return `${p.base}-PERP ${p.side} ${p.size}${p.mark !== undefined ? ` · mark ${fmtPrice(p.mark)}` : ""} · ${p.liq ? `liquidation ${fmtPrice(p.liq)}${d !== undefined ? ` (${d.toFixed(1)}% away)` : ""}` : "no liquidation price"}`;
+    }).join("\n");
+  }
+
+  private watchButtons(u: User, addr: string): Button[][] {
+    const hex = addr.slice(2).toLowerCase();
+    const row: Button[] = [];
+    if (u.owner?.toLowerCase() !== addr.toLowerCase()) row.push({ text: "Guard it: link this account", callback_data: `wg:${hex}` });
+    row.push({ text: "Unwatch", callback_data: `uw:${hex}` });
+    return [row];
+  }
+
+  private async cmdWatch(u: User, chat: number, arg?: string): Promise<void> {
+    const mine = u.watches ?? [];
+    if (!arg) {
+      if (!mine.length) { await this.say(chat, `You watch no accounts.\n${this.watchUsage(u.liqWarnPct)}`); return; }
+      // From the Protector's cache only: no new chain reads.
+      const parts = mine.map((w) => {
+        const v = this.protector.watchView(w.addr);
+        if (v.at === undefined && u.owner?.toLowerCase() === w.addr.toLowerCase()) return `${addrLink(w.addr)}\nyour linked account: your own alerts cover it (/positions)`;
+        return this.watchSummary(w.addr, v);
+      });
+      await this.say(chat, `<b>Watched accounts</b> (warning within ${u.liqWarnPct}% of liquidation)\n\n${parts.join("\n\n")}`,
+        mine.map((w) => [{ text: `Unwatch ${w.addr.slice(0, 6)}…${w.addr.slice(-4)}`, callback_data: `uw:${w.addr.slice(2).toLowerCase()}` }]));
+      return;
+    }
+    if (!isAddress(arg)) { await this.say(chat, `That is not an account address.\n${this.watchUsage(u.liqWarnPct)}`); return; }
+    const addr = getAddress(arg);
+    if (BigInt(addr) === 0n) { await this.say(chat, "That is the zero address: nothing to watch."); return; }
+    if (!this.buckets.allow(`watch:${u.id}`, LIMITS.watchAddsPer10Min, 10 * 60_000)) { await this.say(chat, "Too many /watch requests: please wait a few minutes."); return; }
+    const lower = addr.toLowerCase();
+    if (mine.some((w) => w.addr.toLowerCase() === lower)) { await this.say(chat, `You already watch ${addrLink(addr)}. /watch lists your accounts.`, this.watchButtons(u, addr)); return; }
+    if (mine.length >= LIMITS.watchesPerUser) { await this.say(chat, `You can watch up to ${LIMITS.watchesPerUser} accounts. /unwatch one first.`); return; }
+    const all = this.store.watchedAddresses();
+    if (!all.includes(lower) && all.length >= LIMITS.watchedMax) { await this.say(chat, "Watch mode is full right now. Please try again later."); return; }
+    u.watches = [...mine, { addr, at: Date.now() }];
+    this.store.save();
+    await this.protector.refreshWatched(addr).catch(() => {});
+    let view: { equity?: number; positions: { base: string; side: Side; size: number; mark?: number; liq?: number }[] } = this.protector.watchView(addr);
+    if (this.protector.watchView(addr).at === undefined) view = await this.venue.account(addr).catch(() => ({ positions: [] })); // e.g. your own linked account
+    await this.say(chat,
+      `👀 <b>Watching</b> ${this.watchSummary(addr, view)}\n\n` +
+      `I warn you when a position gets within ${u.liqWarnPct}% of liquidation (/alerts changes it) and tell you when a warned position is gone. Read only: nothing is ever sent for this account.`,
+      this.watchButtons(u, addr));
+  }
+
+  private async cmdUnwatch(u: User, chat: number, arg?: string): Promise<void> {
+    const mine = u.watches ?? [];
+    if (!mine.length) { await this.say(chat, "You watch no accounts."); return; }
+    let target: string;
+    if (arg) {
+      if (!isAddress(arg)) { await this.say(chat, "Send <code>/unwatch 0xAccount</code>."); return; }
+      target = arg.toLowerCase();
+    } else if (mine.length === 1) {
+      target = mine[0]!.addr.toLowerCase();
+    } else {
+      await this.say(chat, "Which one?", mine.map((w) => [{ text: `Unwatch ${w.addr.slice(0, 6)}…${w.addr.slice(-4)}`, callback_data: `uw:${w.addr.slice(2).toLowerCase()}` }]));
+      return;
+    }
+    const left = mine.filter((w) => w.addr.toLowerCase() !== target);
+    if (left.length === mine.length) { await this.say(chat, "You are not watching that account. /watch lists yours."); return; }
+    if (left.length) u.watches = left; else delete u.watches;
+    this.store.save();
+    await this.protector.refreshWatched(target).catch(() => {}); // drops the entries nobody watches any more
+    await this.say(chat, `Stopped watching ${addrLink(getAddress(target))}.`);
+  }
+
+  private async watchWarn(u: User, addr: string, _base: string, text: string): Promise<void> {
+    await this.say(u.id, `⚠️ <b>Watched account</b> ${addrLink(getAddress(addr))}: ${h(text)}`, this.watchButtons(u, addr));
+  }
+
+  private async watchGone(u: User, addr: string, base: string, side: Side): Promise<void> {
+    await this.say(u.id, `The ${base}-PERP ${side} on ${addrLink(getAddress(addr))} is gone (closed or liquidated).`, [[{ text: "Unwatch", callback_data: `uw:${addr.slice(2).toLowerCase()}` }]]);
+  }
+
+  private async guardIt(u: User, chat: number, addr: `0x${string}`): Promise<void> {
+    if (u.owner?.toLowerCase() === addr.toLowerCase()) { await this.say(chat, "This account is already linked here: /tp, /sl, /alerts and /guard work on it."); return; }
+    if (u.owner) { await this.say(chat, `One account per Telegram user: you are linked to ${addrLink(u.owner)}. Send /unlink first, then link this one.`); return; }
+    await this.say(chat,
+      `<b>Guard ${addr.slice(0, 6)}…${addr.slice(-4)}</b> (if it is your account)\n` +
+      `1. In <a href="${APP_URL}">app.testnet.dreamdex.io</a> connect the wallet of that account, open it, <b>Link a bot</b>.\n` +
+      `2. Paste your bot key <code>${u.keyAddress}</code>, keep <b>Perps</b> ticked, <b>Add bot</b>.\n` +
+      `3. Send <code>/link ${addr}</code>.\n\n` +
+      `Then <code>/guard 3</code> closes a position for you when it gets within 3% of liquidation, and /tp, /sl work on it. The key can never withdraw.`);
   }
 
   // ---------- buttons ----------
   private async onCallback(q: TgCallback): Promise<void> {
     const data = q.data ?? "";
     const chat = q.from.id; // private chats only: the user's own chat
-    const u = this.store.get(q.from.id);
     await this.tg.answerCallback(q.id).catch(() => {});
-    if (!u) { await this.say(chat, "Send /start first."); return; }
     try {
+      // Buttons from /demo work before /start.
+      if (data === "dc") { await this.demoCard(q.from.id, chat); return; }
+      if (data === "st") { await this.cmdStart(q.from.id, chat); return; }
+      if (data === "wd") { const r = await this.ensureUser(q.from.id, chat); if (r) await this.cmdWatch(r.user, chat, this.demoAccount); return; }
+      const u = this.store.get(q.from.id);
+      if (!u) { await this.say(chat, "Send /start first."); return; }
       if (data === "chk") {
         if (!this.linkCheckAllowed(u.id)) { await this.say(chat, "Please wait a minute before checking again."); return; }
         const owners = await findLinkedOwners(this.venue.pub, u.keyAddress, 30);
@@ -591,6 +963,16 @@ export class Bot {
       }
       const cd = /^cd:([A-Z0-9]{1,12})$/.exec(data);
       if (cd) { await this.cmdCard(u, chat, cd[1]); return; }
+      const cm = /^cm:([0-9a-f]{10}):(10|25|50)$/.exec(data);
+      if (cm) { await this.copyPreview(u, chat, cm[1]!, Number(cm[2])); return; }
+      const cx = /^cx:([0-9a-f]{12}):([01])$/.exec(data);
+      if (cx) { await this.copyConfirm(u, chat, cx[1]!, cx[2] === "1"); return; }
+      const wm = /^(uw|wg):([0-9a-f]{40})$/.exec(data);
+      if (wm) {
+        const addr = getAddress(`0x${wm[2]!}`);
+        if (wm[1] === "uw") await this.cmdUnwatch(u, chat, addr); else await this.guardIt(u, chat, addr);
+        return;
+      }
     } catch (e) {
       if (e instanceof UserError) { await this.say(chat, h(e.message)); return; }
       log("callback failed", String(e instanceof Error ? e.message : e).slice(0, 300));

@@ -5,7 +5,8 @@ import { ORDER_TYPE, SOMNIA_TESTNET_ADDRESSES, SomniaMarkets } from "@somnia-cha
 import { createPublicClient, defineChain, formatUnits, http, parseAbi, type PublicClient } from "viem";
 import { CHAIN_ID, INDEXER_URL, LIMITS, RPC_URL, WS_URL } from "./config.ts";
 import { alignPrice, alignQuantity, perpMarkets, toRaw, type PerpMarket } from "./vendor/perp-core/markets.ts";
-import { createTradingKey, linkStatus, placeFor, type TradingKey } from "./vendor/perp-core/operator.ts";
+import { createTradingKey, linkStatus, placeFor, SendError, type TradingKey } from "./vendor/perp-core/operator.ts";
+import { KeyedLock } from "./locks.ts";
 import { sizeOrder } from "./vendor/perp-core/orders.ts";
 import type { Side } from "./parse.ts";
 
@@ -32,6 +33,14 @@ export interface TradeResult {
 
 export class UserError extends Error {}
 
+/** The order may have reached the chain: never report it as "nothing was sent", never resend it automatically. */
+export class OutcomeUnknown extends UserError {
+  constructor(message: string, readonly hash?: `0x${string}`) { super(message); this.name = "OutcomeUnknown"; }
+}
+
+/** The lock interface `sendLock` needs (tests swap in a pass-through as the positive control). */
+export interface RunLock { run<T>(key: string, f: () => Promise<T>): Promise<T> }
+
 export class Venue {
   readonly pub: PublicClient;
   exchange!: SomniaMarkets;
@@ -39,6 +48,8 @@ export class Venue {
   private byPool = new Map<string, PerpMarket>();
   private loadedAt = 0;
   private keys = new Map<number, TradingKey>();
+  /** One send at a time per trading key (innermost lock), so two orders never pick the same nonce. */
+  sendLock: RunLock = new KeyedLock();
 
   constructor() {
     this.pub = createPublicClient({ chain, transport: http(RPC_URL, { timeout: 30_000, retryCount: 2 }) }) as PublicClient;
@@ -156,12 +167,12 @@ export class Venue {
     return { linked: linked.sort(), missing: missing.sort() };
   }
 
-  private async touch(m: PerpMarket, side: Side, mark: number): Promise<number> {
+  private async touch(m: PerpMarket, side: Side, mark: number, maxPct: number = LIMITS.maxTouchVsMarkPct): Promise<number> {
     const book = await this.exchange.fetchOrderBook(m.symbol, 1);
     const t = side === "long" ? book.asks[0]?.[0] : book.bids[0]?.[0];
     if (t === undefined) throw new UserError(`No ${side === "long" ? "sellers" : "buyers"} on the ${m.display} book right now. Nothing was sent.`);
-    if (Math.abs(t - mark) / mark * 100 > LIMITS.maxTouchVsMarkPct) {
-      throw new UserError(`The ${m.display} book is thin: best ${side === "long" ? "ask" : "bid"} ${t} is more than ${LIMITS.maxTouchVsMarkPct}% from the mark ${mark.toFixed(4)}. Nothing was sent.`);
+    if (Math.abs(t - mark) / mark * 100 > maxPct) {
+      throw new UserError(`The ${m.display} book is thin: best ${side === "long" ? "ask" : "bid"} ${t} is more than ${maxPct}% from the mark ${mark.toFixed(4)}. Nothing was sent.`);
     }
     return t;
   }
@@ -174,15 +185,32 @@ export class Venue {
 
   private async send(tk: TradingKey, m: PerpMarket, side: Side, price: bigint, quantity: bigint) {
     try {
-      return await placeFor(tk, { pool: m.info.poolAddress, isBid: side === "long", price, quantity, orderType: ORDER_TYPE.MARKET });
+      return await this.sendLock.run(tk.operator.toLowerCase(), () =>
+        placeFor(tk, { pool: m.info.poolAddress, isBid: side === "long", price, quantity, orderType: ORDER_TYPE.MARKET }));
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
+      const ts = new Date().toISOString();
+      const phase = e instanceof SendError ? e.phase : "after-receipt";
+      if (phase === "reverted") throw new UserError(`The order reverted on chain: tx ${(e as SendError).hash}`);
+      if (phase === "send") {
+        // The node refused the raw transaction for gas money: it never entered the chain.
+        if (/insufficient funds|exceeds the balance/i.test(msg)) throw new UserError("Your bot key has no STT for gas. Send it some STT (see /key). Nothing was sent.");
+        console.log(ts, "order outcome unknown (send):", msg.split("\n")[0]!.slice(0, 200));
+        throw new OutcomeUnknown("I could not confirm that the order reached the chain. Check /positions before you try again; I will not resend it.");
+      }
+      if (phase === "wait" || phase === "after-receipt") {
+        // Posted (wait) or even mined (a decode failure after the receipt): the order may have filled.
+        const hash = e instanceof SendError ? e.hash : undefined;
+        console.log(ts, `order outcome unknown (${phase}):`, msg.split("\n")[0]!.slice(0, 200));
+        throw new OutcomeUnknown(`The order was sent${hash ? ` (tx ${hash})` : ""} but its result is not confirmed yet. Check /positions; I will not resend it.`, hash);
+      }
+      // phase === "simulate": the eth_call refused it, nothing reached the chain.
       if (msg.includes("ImmediateOrCancelNoFill")) throw new UserError("The book moved and nothing would fill. Nothing was sent; try again.");
       if (msg.includes("OnlyApprovedContracts") || msg.includes("NotAuthorized") || msg.includes("Unauthorized")) throw new UserError(`Your bot key is not linked for ${m.display}. Open the app, Link a bot, paste your bot address again.`);
       if (/insufficient funds|exceeds the balance/i.test(msg)) throw new UserError("Your bot key has no STT for gas. Send it some STT (see /key).");
       const hash = /tx (0x[0-9a-fA-F]{64})/.exec(msg)?.[1];
       if (hash) throw new UserError(`The order reverted on chain: tx ${hash}`);
-      console.log(new Date().toISOString(), "order rejected:", msg.split("\n").filter((l) => /Error|reason|revert/i.test(l)).join(" | ").slice(0, 300));
+      console.log(ts, "order rejected:", msg.split("\n").filter((l) => /Error|reason|revert/i.test(l)).join(" | ").slice(0, 300));
       const named = /reverted with the following reason:\s*([^\n]{1,120})|Error: ([A-Za-z0-9_]+)\(/.exec(msg);
       throw new UserError(`The venue rejected the order${named ? `: ${(named[1] ?? named[2])!.trim()}` : ""}. Nothing was sent.`);
     }
@@ -197,12 +225,13 @@ export class Venue {
   }
 
   /** Market (IOC) order for `notional` USDso. */
-  async open(tk: TradingKey, base: string, side: Side, notional: number): Promise<TradeResult> {
+  /** `opts.maxTouchPct`: refuse when the best price is further than this from the mark (card copies use 0.5 %). */
+  async open(tk: TradingKey, base: string, side: Side, notional: number, opts: { maxTouchPct?: number } = {}): Promise<TradeResult> {
     const m = this.market(base);
     if (!m) throw new UserError(`Unknown market ${base}.`);
     const mark = await this.mark(m);
     if (!mark) throw new UserError(`${m.display} has no fresh mark price right now (oracle stale). Nothing was sent.`);
-    const touch = await this.touch(m, side, mark);
+    const touch = await this.touch(m, side, mark, opts.maxTouchPct);
     const wanted = alignQuantity(toRaw(notional / mark, m.info.baseDecimals), m.info);
     if (wanted === 0n) {
       const min = Number(formatUnits(BigInt(m.info.minQuantity), m.info.baseDecimals));
