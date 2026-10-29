@@ -177,8 +177,8 @@ These four orders are also the first live run of the hardened send path (signed 
 Posts about Perps Copilot that tag @DreamDEXSomnia:
 
 1. Proof clip: a stop-loss closed by the bot through Somnia Reactivity, then `/card` (2026-10-21): https://x.com/swiftbotlab/status/2112695927035371609
-2. Launch, with a real PnL card from a closed testnet trade (2026-10-20): https://x.com/swiftbotlab/status/2112551079061889196
-3. `/watch`: read-only liquidation pings for any dreamDEX account, first live alert on Tokyo testnet (2026-10-26): https://x.com/swiftbotlab/status/2114544266550911233
+2. Thread: what you can try in 60 s without a wallet, and 30+ real orders on chain: https://x.com/swiftbotlab/status/2115630821919101255
+3. Chain-held TP/SL, checked: a resting order that made an armed stop close nothing, flagged by `/stops` and an unprompted alert: https://x.com/swiftbotlab/status/2115630983320048077
 
 ## Run it yourself
 
