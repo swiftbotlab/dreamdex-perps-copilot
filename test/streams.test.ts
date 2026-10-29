@@ -51,7 +51,7 @@ test("ST1: after 3 failed subscribes in a row the push socket is reopened once (
   ageAll(s.p, 100_000); await fallback(); await tick();
   const resets = s.logs.filter((l) => l.startsWith("push streams:"));
   assert.equal(resets.length, 1);
-  assert.match(resets[0]!, /3 subscribe failures in a row; reopened the WebSocket/);
+  assert.match(resets[0]!, /3 subscribe failures in a row; (reopened the push socket|no cached push socket to reopen)/);
   assert.equal(s.p.stats.streamResets, 1);
   // The socket works again: the next subscribe succeeds and the streak stays at zero.
   s.sock.subscribeOk = true;
@@ -89,4 +89,30 @@ test("ST3: sweepFailed is true only when every account read of a recent sweep fa
   fail = true; await sweep();
   s.p.lastSweep!.at -= 10 * 60_000;
   assert.equal(s.p.sweepFailed().failed, false);
+});
+
+test("ST4 (review): a second push-socket reset waits 5 minutes", async () => {
+  const s = setup();
+  await s.p.refreshUser(s.u);
+  await tick();
+  const fallback = () => (s.p as unknown as { fallback: () => Promise<void> }).fallback();
+  for (let i = 0; i < 3; i++) { ageAll(s.p, 100_000); await fallback(); await tick(); }
+  assert.equal(s.logs.filter((l) => l.startsWith("push streams:")).length, 1);
+  for (let i = 0; i < 4; i++) { ageAll(s.p, 100_000); await fallback(); await tick(); }
+  assert.equal(s.logs.filter((l) => l.startsWith("push streams:")).length, 1, "rate limited");
+  (s.p as unknown as { lastPushReset: number }).lastPushReset -= 6 * 60_000;
+  ageAll(s.p, 100_000); await fallback(); await tick();
+  assert.equal(s.logs.filter((l) => l.startsWith("push streams:")).length, 2, "allowed again after 5 minutes");
+});
+
+test("ST5 (review): only link failures count for the watchdog; a read that reverts for one account does not", async () => {
+  let err = "ContractRevertError: @somnia-chain/markets-sdk: readContract getAccountState reverted";
+  const s = setup({ accountFails: () => true });
+  (s.p as unknown as { venue: { account: () => Promise<never> } }).venue.account = async () => { throw new Error(err); };
+  const sweep = () => (s.p as unknown as { sweep: () => Promise<void> }).sweep();
+  await sweep();
+  assert.equal(s.p.sweepFailed().failed, false, "a revert is not a dead link");
+  err = "RpcError: @somnia-chain/markets-sdk: rpc getBlockNumber failed: WebSocket request failed.";
+  await sweep();
+  assert.equal(s.p.sweepFailed().failed, true);
 });

@@ -6,16 +6,25 @@
 // Watched accounts (/watch, read only): the same pushes check their liquidation distance and send warnings to
 // the watchers. Nothing is ever sent to the chain for a watched account.
 import { createPublicClient, decodeAbiParameters, toFunctionSelector, webSocket } from "viem";
+import { socketClientCache } from "viem/utils";
 import { LIMITS, WS_URL } from "./config.ts";
 import { fmtPrice, liqDistancePct, triggered, type Side } from "./parse.ts";
 import type { Store, User } from "./store.ts";
-import { chain, closeSockets, type AccountView, type Venue } from "./venue.ts";
+import { chain, type AccountView, type Venue } from "./venue.ts";
 
 const MARK_SEL = toFunctionSelector("tryGetMarkPrice()");
 const SILENT_MS = 15_000;
 const RESUB_MS = 90_000;
 const REFRESH_MS = 30_000;
 const SUB_FAIL_RESET = 3; // subscribe failures in a row before the push socket is reopened
+const PUSH_RESET_GAP_MS = 5 * 60_000; // at most one push-socket reopen per 5 minutes
+/** Errors that mean the link (socket, HTTP, DNS, timeout) failed, not the read itself (a revert, a decode). */
+export const TRANSPORT_ERR = /WebSocket|socket|closed|timed? ?out|took too long|fetch failed|ECONN|ENOTFOUND|EAI_AGAIN|network|HTTP request failed|unknown RPC error/i;
+export const PUSH_WS_OPTS = { keepAlive: { interval: 20_000 }, reconnect: { attempts: 1_000, delay: 2_000 } };
+/** viem's cache id of the push client's socket (viem 2.54.1 utils/rpc/socket.js: JSON of keepAlive, key, url, reconnect). */
+export function pushSocketId(url: string): string {
+  return JSON.stringify({ keepAlive: PUSH_WS_OPTS.keepAlive, key: "socket", url, reconnect: PUSH_WS_OPTS.reconnect });
+}
 
 /** A linked user's position as last read. `owner` (lowercase) is the account it was read from. */
 export interface Held { userId: number; owner: string; base: string; pool: `0x${string}`; side: Side; size: number; entry: number; liq?: number }
@@ -45,10 +54,11 @@ export class Protector {
   private watchRefreshing = false;
   private running = new Set<Promise<unknown>>();     // acts in flight (drained on shutdown)
   private stopped = false;
-  private ws = createPublicClient({ chain, transport: webSocket(WS_URL, { keepAlive: { interval: 20_000 }, reconnect: { attempts: 1_000, delay: 2_000 }, timeout: 20_000 }) });
+  private ws = createPublicClient({ chain, transport: webSocket(WS_URL, { ...PUSH_WS_OPTS, timeout: 20_000 }) });
+  private lastPushReset = 0;
   stats = { pushes: 0, polls: 0, triggers: 0, streamResets: 0 };
   /** The last periodic sweep of linked accounts: how many refreshes worked and failed (watchdog input). */
-  lastSweep?: { at: number; ok: number; failed: number; error?: string };
+  lastSweep?: { at: number; ok: number; failed: number; transport: number; error?: string };
   private subFailStreak = 0;
   private timers: NodeJS.Timeout[] = [];
 
@@ -124,19 +134,33 @@ export class Protector {
       const u = this.store.get(h.userId);
       if (!u || u.owner?.toLowerCase() !== h.owner) this.dropUser(h.userId); // gone, unlinked or relinked
     }
-    let ok = 0, failed = 0, error: string | undefined;
+    let ok = 0, failed = 0, transport = 0, error: string | undefined;
     for (const u of this.store.all()) {
       if (!u.owner) continue;
-      try { await this.refreshUser(u); ok++; } catch (e) { failed++; error = String(e).slice(0, 120); this.log("refresh failed", error); }
+      try { await this.refreshUser(u); ok++; } catch (e) {
+        failed++; error = String(e).slice(0, 120); this.log("refresh failed", error);
+        if (TRANSPORT_ERR.test(error)) transport++;
+      }
     }
-    this.lastSweep = { at: Date.now(), ok, failed, error };
+    this.lastSweep = { at: Date.now(), ok, failed, transport, error };
   }
 
-  /** True when the last sweep (within `maxAgeMs`) had accounts to read and every read failed. */
+  /**
+   * True when the last sweep (within `maxAgeMs`) read no account and at least one read failed on the link itself.
+   * A read that reverts or does not decode for one account says nothing about the link and never counts.
+   */
   sweepFailed(maxAgeMs = 2 * REFRESH_MS): { failed: boolean; error?: string } {
     const s = this.lastSweep;
     if (!s || Date.now() - s.at > maxAgeMs) return { failed: false };
-    return { failed: s.failed > 0 && s.ok === 0, error: s.error };
+    return { failed: s.ok === 0 && s.transport > 0, error: s.error };
+  }
+
+  /** Close only the push client's own cached socket (the SDK's read socket stays up); the next subscribe opens a new one. */
+  private closePushSocket(): boolean {
+    const c = socketClientCache.get(pushSocketId(WS_URL));
+    if (!c) return false;
+    try { c.close(); } catch { /* already dead */ }
+    return true;
   }
 
   /** Drop every push subscription and subscribe again (after the sockets were reopened). */
@@ -265,11 +289,12 @@ export class Protector {
       const mark = await this.venue.mark(m).catch(() => undefined);
       if (mark) { this.stats.polls++; await this.onMark(pool, mark, "poll"); }
       if (quiet > RESUB_MS) {
-        if (this.subFailStreak >= SUB_FAIL_RESET) {
+        if (this.subFailStreak >= SUB_FAIL_RESET && now - this.lastPushReset > PUSH_RESET_GAP_MS) {
           // A socket that gave up reconnecting stays cached by URL and refuses every new subscription: reopen it.
-          const n = closeSockets(WS_URL);
-          this.log(`push streams: ${this.subFailStreak} subscribe failures in a row; reopened the WebSocket (${n} socket${n === 1 ? "" : "s"} closed)`);
+          const closed = this.closePushSocket();
+          this.log(`push streams: ${this.subFailStreak} subscribe failures in a row; ${closed ? "reopened the push socket" : "no cached push socket to reopen"}`);
           this.subFailStreak = 0;
+          this.lastPushReset = now;
           this.stats.streamResets++;
         }
         this.log("re-subscribing", pool.slice(0, 10), "quiet", Math.round(quiet / 1000), "s");

@@ -164,12 +164,76 @@ test("S9: /stops says when the indexer lags; ids from the registry logs reach th
   await h.handle(msg(96, "/stops"));
   assert.doesNotMatch(h.to(96).at(-1)!.html, /behind the chain/);
   const seen: unknown[][] = [];
-  h.bot.venue.recentStopIds = async () => [{ registry: "0x00000000000000000000000000000000000000aa", orderId: "77" }];
+  h.bot.venue.recentStopIds = async (owners: string[]) => new Map(owners.map((o) => [o.toLowerCase(), [{ registry: "0x00000000000000000000000000000000000000aa", orderId: "77" }]]));
   h.bot.venue.nativeStops = async (_o: string, refs: unknown[] = []) => { seen.push(refs); return []; };
   await h.bot.stopHealthRound();
   assert.deepEqual(seen.at(-1), [{ registry: "0x00000000000000000000000000000000000000aa", orderId: "77" }]);
   for (const v of h.bot.stopLogs.get(O.toLowerCase()).values()) v.at -= 16 * 60_000;
-  h.bot.venue.recentStopIds = async () => [];
+  h.bot.venue.recentStopIds = async () => new Map();
   await h.bot.stopHealthRound();
   assert.deepEqual(seen.at(-1), [], "expired after 15 minutes");
+});
+
+test("S10 (review): a failed alert send is retried next pass; /stops on your own account skips the global limit; logs only for your own account", async () => {
+  const h = makeBot();
+  const O = addr(0x999);
+  h.addUser(98, O);
+  h.state.positions.set(O.toLowerCase(), [{ base: "ETH", side: "long", size: 2, entry: 100 }]);
+  h.state.stops = [stop({ trigger: 95 })];
+  h.state.cap = { position: 2, pendingBid: 0, pendingAsk: 2, effective: 0 };
+  h.blocked.add(98);
+  await h.bot.stopHealthRound();
+  assert.equal(Object.keys(h.bot.store.get(98).stopWarned ?? {}).length, 0, "not marked: Telegram refused it");
+  h.blocked.delete(98); delete h.bot.store.get(98).blockedAt;
+  await h.bot.stopHealthRound();
+  assert.equal(h.to(98).filter((s) => /Stop health/.test(s.html)).length, 1, "sent on the next pass");
+  // fill the global /stops budget with other people's lookups
+  for (let i = 0; i < 70; i++) h.bot.buckets.allow("stops:all", 60, 60_000);
+  await h.handle(msg(98, "/stops"));
+  assert.match(h.to(98).at(-1)!.html, /Chain-held stops/, "own account still answered");
+  await h.handle(msg(99, `/stops ${O}`));
+  assert.match(h.to(99).at(-1)!.html, /a few times a minute/, "another account waits on the global limit");
+  // log-found ids reach only the owner's own view
+  const calls: unknown[][] = [];
+  h.bot.venue.nativeStops = async (_o: string, refs: unknown[] = []) => { calls.push(refs); return []; };
+  h.bot.addRecent(O, [{ registry: "0x00000000000000000000000000000000000000aa", orderId: "5" }]);
+  h.bot.stopCache.clear();
+  await h.bot.stopReports(O, { withLogs: false });
+  await h.bot.stopReports(O, { withLogs: true });
+  assert.deepEqual(calls.map((c) => c.length), [0, 1]);
+});
+
+test("S11 (review): a relink starts stop tracking afresh (no 'fired' news about the old account); opening stops are not tracked", async () => {
+  const h = makeBot();
+  const A = addr(0xa1), B = addr(0xb2);
+  const u = h.addUser(120, A);
+  h.state.positions.set(A.toLowerCase(), [{ base: "ETH", side: "long", size: 2, entry: 100 }]);
+  h.state.cap = { position: 2, pendingBid: 0, pendingAsk: 0, effective: 2 };
+  h.state.stops = [stop({ trigger: 95 }), stop({ id: "0x00000000000000000000000000000000000000aa_9", orderId: "9", reduceOnly: false })];
+  await h.bot.stopHealthRound();
+  u.owner = B; h.bot.store.save();
+  h.state.stops = [];
+  h.state.stopRows = [{ registry: "0x00000000000000000000000000000000000000aa", orderIdRaw: "1", status: "TRIGGERED", dropReason: null, cancelReason: null }];
+  await h.bot.stopHealthRound();
+  assert.ok(!h.to(120).some((s) => /fired/.test(s.html)), "no news about the old account");
+  u.owner = A; h.bot.store.save();
+  h.state.stops = [stop({ id: "0x00000000000000000000000000000000000000aa_9", orderId: "9", reduceOnly: false })];
+  await h.bot.stopHealthRound();
+  h.state.stops = [];
+  h.state.stopRows = [{ registry: "0x00000000000000000000000000000000000000aa", orderIdRaw: "9", status: "TRIGGERED", dropReason: null, cancelReason: null }];
+  await h.bot.stopHealthRound();
+  assert.ok(!h.to(120).some((s) => /fired/.test(s.html)), "an opening stop is not reported as a TP/SL");
+});
+
+test("S12 (review): /stops keeps under Telegram's limit with many stops, whole markets only", async () => {
+  const h = makeBot();
+  const O = addr(0xc3);
+  const many: NativeStop[] = [];
+  for (let i = 0; i < 30; i++) many.push(stop({ id: `0x00000000000000000000000000000000000000aa_${i}`, orderId: String(i), base: i % 2 ? "ETH" : "SOL", trigger: 90 + i }));
+  h.state.stops = many;
+  await h.handle(msg(130, `/stops ${O}`));
+  const out = h.to(130).at(-1)!.html;
+  assert.ok(out.length < 4_000, `length ${out.length}`);
+  assert.match(out, /… and \d+ more stops on (ETH|SOL)-PERP/);
+  assert.equal((out.match(/<b>/g) ?? []).length, (out.match(/<\/b>/g) ?? []).length, "tags balanced");
 });

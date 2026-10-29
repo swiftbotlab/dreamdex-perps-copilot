@@ -86,6 +86,9 @@ export const LIMITS = {
   stopCheckUsersMax: 50,              // accounts per pass (each costs 1 indexer read + 1-2 chain reads per market)
   stopWarnRepeatMs: 24 * 3_600_000,   // the same warning about the same stop is sent at most once a day
   stopWarnedMax: 30,
+  stopCacheMs: 15_000,                // /stops, /positions and the alert pass share one read per account per 15 s
+  stopLinesPerMarket: 8,
+  stopsMsgBudget: 3_200,              // characters of market sections in one /stops reply (Telegram's limit is 4,096)
   // chain-link watchdog (src/watchdog.ts): one probe every 30 s; 6 failed in a row = rebuild, 6 more = exit 75
   watchdogMs: 30_000,
   // shutdown

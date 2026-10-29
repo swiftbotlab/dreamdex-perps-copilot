@@ -5,7 +5,10 @@ import assert from "node:assert/strict";
 import { createServer } from "node:net";
 import { WebSocketServer } from "ws";
 import { RpcWatchdog } from "../src/watchdog.ts";
+import { createPublicClient, webSocket } from "viem";
+import { socketClientCache } from "viem/utils";
 import { makeBot, venueMod } from "./_harness.ts";
+import { PUSH_WS_OPTS, pushSocketId } from "../src/protect.ts";
 
 function fake(opts: { failLimit?: number; exitAfter?: number; probeTimeoutMs?: number } = {}) {
   const st = { ok: true, hang: false, rebuilds: 0, exits: [] as number[], logs: [] as string[], probes: 0 };
@@ -150,6 +153,30 @@ test("WD6 (real socket): the SDK's client stays dead after its server returns; c
     assert.equal(await read(), 42n, "a fresh socket after closeSockets()");
   } finally {
     console.error = quiet;
+    venueMod.closeSockets(url);
+    await ex.close().catch(() => {});
+    await stopServer(wss);
+  }
+});
+
+test("WD7 (real socket): pushSocketId names exactly the push client's cached socket, so a push reset leaves the SDK's socket alone", { timeout: 30_000 }, async () => {
+  const { SomniaMarkets, SOMNIA_TESTNET_ADDRESSES } = await import("@somnia-chain/markets-sdk");
+  const port = await freePort();
+  const url = `ws://127.0.0.1:${port}`;
+  const wss = await rpcServer(port);
+  const push = createPublicClient({ chain: venueMod.chain, transport: webSocket(url, { ...PUSH_WS_OPTS, timeout: 5_000 }) });
+  const ex = new SomniaMarkets({ indexerUrl: "http://127.0.0.1:9/v1/graphql", chain: venueMod.chain, wsRpcUrl: url, addresses: SOMNIA_TESTNET_ADDRESSES });
+  try {
+    assert.equal(await push.getBlockNumber({ cacheTime: 0 }), 42n);
+    assert.equal(await ex.client.getViemClient().getBlockNumber({ cacheTime: 0 }), 42n);
+    const mine = [...socketClientCache.entries()].filter(([, c]) => c.url === url);
+    assert.equal(mine.length, 2, "two sockets for one URL: push + SDK");
+    assert.ok(socketClientCache.has(pushSocketId(url)), "the id matches viem's");
+    socketClientCache.get(pushSocketId(url))!.close();
+    assert.equal([...socketClientCache.values()].filter((c) => c.url === url).length, 1, "the SDK's socket is untouched");
+    assert.equal(await ex.client.getViemClient().getBlockNumber({ cacheTime: 0 }), 42n, "SDK reads still work");
+    assert.equal(await push.getBlockNumber({ cacheTime: 0 }), 42n, "the push client reopens on its next request");
+  } finally {
     venueMod.closeSockets(url);
     await ex.close().catch(() => {});
     await stopServer(wss);

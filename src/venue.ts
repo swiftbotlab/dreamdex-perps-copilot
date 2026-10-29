@@ -4,7 +4,7 @@
 import { ORDER_TYPE, SOMNIA_TESTNET_ADDRESSES, SomniaMarkets } from "@somnia-chain/markets-sdk";
 import { createPublicClient, defineChain, formatUnits, http, parseAbi, toEventSelector, type PublicClient } from "viem";
 import { socketClientCache } from "viem/utils";
-import { CHAIN_ID, DEMO_ACCOUNT, INDEXER_URL, LIMITS, RPC_URL, WS_URL } from "./config.ts";
+import { CHAIN_ID, INDEXER_URL, LIMITS, RPC_URL, WS_URL } from "./config.ts";
 import { alignPrice, alignQuantity, perpMarkets, toRaw, type PerpMarket } from "./vendor/perp-core/markets.ts";
 import { createTradingKey, linkStatus, placeFor, SendError, type TradingKey } from "./vendor/perp-core/operator.ts";
 import { KeyedLock } from "./locks.ts";
@@ -73,11 +73,9 @@ export class Venue {
     return new SomniaMarkets({ indexerUrl: INDEXER_URL, chain, wsRpcUrl: WS_URL, addresses: SOMNIA_TESTNET_ADDRESSES });
   }
 
-  /** Watchdog probe: the same read the position sweep does (block pin + account state), over the SDK's socket. */
+  /** Watchdog probe: a block-number read over the SDK's own socket (the read that failed for 28 h), never cached. */
   async probe(): Promise<void> {
-    const m = this.list()[0];
-    if (!m) throw new Error("no markets loaded");
-    await this.exchange.client.getMarginAccount(m.info.marginBank, DEMO_ACCOUNT);
+    await this.exchange.client.getViemClient().getBlockNumber({ cacheTime: 0 });
   }
 
   /**
@@ -179,7 +177,8 @@ export class Venue {
     const keep = new Map<string, { m: PerpMarket; ref: { registry: `0x${string}`; orderId: string }; s?: NativeStop }>();
     for (const r of rows.slice(0, 50)) {
       const m = this.marketByPool(String(r.market?.poolAddress ?? ""));
-      if (!m || String(r.registry).toLowerCase() !== m.info.stopRegistry.toLowerCase() || String(r.owner).toLowerCase() !== lower) continue;
+      // Only a row of a known market's own (valid) registry: markets without one are skipped, never dereferenced.
+      if (!m || this.byRegistry.get(String(r.registry).toLowerCase()) !== m || String(r.owner).toLowerCase() !== lower) continue;
       if (!/^\d{1,39}$/.test(r.orderIdRaw) || !DEC.test(r.quantity) || !DEC.test(r.triggerPrice) || (r.triggerOperator !== 0 && r.triggerOperator !== 1)) continue;
       const registry = m.info.stopRegistry;
       const id = `${registry.toLowerCase()}_${r.orderIdRaw}`;
@@ -218,22 +217,27 @@ export class Venue {
   }
 
   /**
-   * Stop ids this owner created in the last 1,000 blocks (about 100 s), from the registries' own logs. One
-   * getLogs (the public RPC serves at most 1,000 blocks per call and takes 2-8 s), so only background passes call it.
+   * Stop ids these owners created in the last 1,000 blocks (about 100 s), from the registries' own logs, grouped by
+   * owner (lowercase). ONE getLogs for all of them (the public RPC serves at most 1,000 blocks per call and takes
+   * 2-8 s), so only the background pass calls it.
    */
-  async recentStopIds(owner: `0x${string}`): Promise<{ registry: `0x${string}`; orderId: string }[]> {
+  async recentStopIds(owners: readonly string[]): Promise<Map<string, { registry: `0x${string}`; orderId: string }[]>> {
     const regs = [...this.byRegistry.keys()] as `0x${string}`[];
-    if (!regs.length) return [];
+    const out = new Map<string, { registry: `0x${string}`; orderId: string }[]>();
+    const want = [...new Set(owners.map((o) => o.toLowerCase()).filter((o) => /^0x[0-9a-f]{40}$/.test(o)))].slice(0, 50);
+    if (!regs.length || !want.length) return out;
     const head = await this.pub.getBlockNumber();
-    const ownerTopic = `0x${owner.slice(2).toLowerCase().padStart(64, "0")}` as `0x${string}`;
     const logs = (await this.pub.request({
       method: "eth_getLogs",
-      params: [{ address: regs, topics: [STOP_CREATED_TOPIC, null, ownerTopic], fromBlock: `0x${(head - 999n).toString(16)}`, toBlock: `0x${head.toString(16)}` }],
+      params: [{ address: regs, topics: [STOP_CREATED_TOPIC, null, want.map((o) => `0x${o.slice(2).padStart(64, "0")}`)], fromBlock: `0x${(head - 999n).toString(16)}`, toBlock: `0x${head.toString(16)}` }],
     } as never)) as { address: string; topics: `0x${string}`[] }[];
-    const out: { registry: `0x${string}`; orderId: string }[] = [];
-    for (const l of logs.slice(0, 50)) {
-      if (!l.topics[1] || !/^0x[0-9a-f]{40}$/i.test(l.address) || !this.byRegistry.has(l.address.toLowerCase())) continue;
-      out.push({ registry: l.address.toLowerCase() as `0x${string}`, orderId: BigInt(l.topics[1]).toString() });
+    for (const l of logs.slice(0, 200)) {
+      if (!l.topics[1] || !l.topics[2] || !/^0x[0-9a-f]{40}$/i.test(l.address) || !this.byRegistry.has(l.address.toLowerCase())) continue;
+      const owner = `0x${l.topics[2].slice(26).toLowerCase()}`;
+      if (!want.includes(owner)) continue;
+      const list = out.get(owner) ?? [];
+      if (list.length < 50) list.push({ registry: l.address.toLowerCase() as `0x${string}`, orderId: BigInt(l.topics[1]).toString() });
+      out.set(owner, list);
     }
     return out;
   }

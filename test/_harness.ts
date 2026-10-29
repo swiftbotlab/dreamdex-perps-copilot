@@ -80,7 +80,7 @@ export function makeBot(opts: { mark?: number; maxLev?: Record<string, number> }
     tradingKey: (_id: number, owner: string) => ({ owner, operator: OPERATOR }),
     txState: async () => "none",
     nativeStops: async () => state.stops,
-    recentStopIds: async () => [],
+    recentStopIds: async () => new Map(),
     indexerLagS: async () => state.lag,
     reducingCapacity: async () => { if (!state.cap) throw new Error("no capacity"); return state.cap; },
     minQty: () => 0.001,

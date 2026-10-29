@@ -79,8 +79,10 @@ export class Bot {
   readonly watchdog: RpcWatchdog;
   private timers: NodeJS.Timeout[] = [];
   /** Stop-health alerts: the pending native stops last seen per user, and the warnings already sent (key -> time). */
-  private stopSeen = new Map<number, Map<string, { base: string; kind: string; trigger: number }>>();
-  private stopWarned = new Map<string, number>();
+  /** Pending reduce-only stops seen in the last pass, per `${telegramId}:${account}` (a relink starts afresh). */
+  private stopSeen = new Map<string, Map<string, { base: string; kind: string; trigger: number }>>();
+  private stopCursor = 0;                              // rotates through linked users when there are more than one pass takes
+  private stopCache = new Map<string, { at: number; v: Awaited<ReturnType<Bot["stopReportsUncached"]>> }>();
   private stopChecking = false;
   /** Stop ids found in the registries' own logs (newer than the indexer), per owner (lowercase), kept 15 minutes. */
   private stopLogs = new Map<string, Map<string, { ref: { registry: `0x${string}`; orderId: string }; at: number }>>();
@@ -324,16 +326,17 @@ export class Bot {
   }
 
   /** Send a message. If Telegram says the user blocked the bot (or the chat is gone), mark them so pings stop. */
-  /** Send a message. Chat 0 = no chat (a scheduled demo trade): nothing is sent. */
-  private say(chat: number, html: string, buttons?: Button[][]) {
-    if (chat === 0) return Promise.resolve(undefined);
-    return this.tg.sendMessage(chat, html, buttons).catch((e) => {
+  /** Send a message; resolves true when Telegram accepted it. Chat 0 = no chat (a scheduled demo trade): nothing is sent. */
+  private say(chat: number, html: string, buttons?: Button[][]): Promise<boolean> {
+    if (chat === 0) return Promise.resolve(true);
+    return this.tg.sendMessage(chat, html, buttons).then(() => true, (e) => {
       const msg = String(e instanceof Error ? e.message : e);
       log("send failed", msg.slice(0, 120));
       if (BLOCKED_RE.test(msg)) {
         const u = this.store.get(chat); // private chats only: the chat id is the user id
         if (u && !u.blockedAt) { u.blockedAt = Date.now(); this.store.save(); }
       }
+      return false;
     });
   }
 
@@ -836,7 +839,7 @@ export class Bot {
     const { owner } = this.requireLinked(u);
     const acct = await this.venue.account(owner);
     if (!acct.positions.length) { await this.say(chat, `No open positions. Equity ${fmtUsd(acct.equity)} USDso. Try <code>/long ETH 20 5x</code>.`); return; }
-    const sr = await this.stopReports(owner, acct).catch(() => undefined);
+    const sr = await this.stopReports(owner, { view: acct, withLogs: true }).catch(() => undefined);
     const chainLine = (base: string) => {
       if (!sr) return "chain-held TP/SL: could not be read right now (/stops)";
       const r = sr.reports.find((x) => x.base === base);
@@ -903,9 +906,24 @@ export class Bot {
   }
 
   // ---------- /stops: dreamDEX's chain-held TP/SL, mirrored and checked ----------
+  /**
+   * stopReportsUncached with a 15 s cache per account. `withLogs`: also use stop ids found in the registries' logs
+   * (collected only for linked accounts, and shown only to that account's own user, so /stops 0xOther cannot tell
+   * whether an account uses this bot).
+   */
+  private async stopReports(owner: `0x${string}`, o: { view?: AccountView; fresh?: boolean; withLogs: boolean }): Promise<{ view: AccountView; reports: PositionReport[]; stops: NativeStop[] }> {
+    const k = `${owner.toLowerCase()}:${o.withLogs ? 1 : 0}`;
+    const c = this.stopCache.get(k);
+    if (!o.fresh && !o.view && c && Date.now() - c.at < LIMITS.stopCacheMs) return c.v;
+    const v = await this.stopReportsUncached(owner, o.view, o.withLogs ? this.recentRefs(owner) : []);
+    if (this.stopCache.size >= 500) this.stopCache.clear();
+    this.stopCache.set(k, { at: Date.now(), v });
+    return v;
+  }
+
   /** Native stops and the pool's closing capacity for every market with a position or a pending stop. */
-  private async stopReports(owner: `0x${string}`, view?: AccountView): Promise<{ view: AccountView; reports: PositionReport[]; stops: NativeStop[] }> {
-    const [v, stops] = await Promise.all([view ? Promise.resolve(view) : this.venue.account(owner), this.venue.nativeStops(owner, this.recentRefs(owner))]);
+  private async stopReportsUncached(owner: `0x${string}`, view: AccountView | undefined, refs: { registry: `0x${string}`; orderId: string }[]): Promise<{ view: AccountView; reports: PositionReport[]; stops: NativeStop[] }> {
+    const [v, stops] = await Promise.all([view ? Promise.resolve(view) : this.venue.account(owner), this.venue.nativeStops(owner, refs)]);
     const bases = [...new Set([...v.positions.map((p) => p.base), ...stops.map((x) => x.base)])].filter((b) => this.venue.market(b));
     const reports = await Promise.all(bases.map(async (b) => {
       const m = this.venue.market(b)!;
@@ -943,15 +961,18 @@ export class Bot {
       target = getAddress(arg);
     } else if (u?.owner) target = u.owner;
     if (!target) { await this.say(chat, "<code>/stops 0xAccount</code> shows the dreamDEX TP/SL the chain holds for an account and checks that each one will close what you expect. Read only. Linked users can send just /stops."); return; }
-    if (!this.buckets.allow(`stops:${id}`, LIMITS.stopsPerMinute, 60_000) || !this.buckets.allow("stops:all", LIMITS.stopsGlobalPerMinute, 60_000)) { await this.say(chat, "One moment: /stops works a few times a minute."); return; }
-    const [{ reports }, lag] = await Promise.all([this.stopReports(target), this.venue.indexerLagS().catch(() => undefined)]);
     const mine = u?.owner?.toLowerCase() === target.toLowerCase() ? u : undefined;
+    // Everyone has a per-user limit; checking another account also counts against a global one (your own never waits on others).
+    if (!this.buckets.allow(`stops:${id}`, LIMITS.stopsPerMinute, 60_000) || (!mine && !this.buckets.allow("stops:all", LIMITS.stopsGlobalPerMinute, 60_000))) { await this.say(chat, "One moment: /stops works a few times a minute."); return; }
+    const [{ reports }, lag] = await Promise.all([this.stopReports(target, { withLogs: !!mine }), this.venue.indexerLagS().catch(() => undefined)]);
     const lagNote = lag !== undefined && lag > 30
       ? `\nℹ️ The dreamDEX indexer is ${Math.round(lag)} s behind the chain right now, so a stop armed in that window may show up only once it catches up${mine ? " (for your linked account the bot also reads the registries' own logs every minute)" : ""}.`
       : "";
     const parts = reports.map((r) => {
       const head = r.pos ? `<b>${r.base}-PERP ${r.pos.side} ${r.pos.size}</b> · mark ${fmtPrice(r.pos.mark)}` : `<b>${r.base}-PERP</b> (no position)`;
-      const lines = r.lines.map((l) => `${this.stopIcon(l.level)} ${h(l.text)}`);
+      const shown = [...r.lines].sort((a, b) => (a.level === "warn" ? 0 : 1) - (b.level === "warn" ? 0 : 1)).slice(0, LIMITS.stopLinesPerMarket);
+      const lines = shown.map((l) => `${this.stopIcon(l.level)} ${h(l.text)}`);
+      if (r.lines.length > shown.length) lines.push(`… and ${r.lines.length - shown.length} more stop${r.lines.length - shown.length === 1 ? "" : "s"} on ${r.base}-PERP`);
       const notes = r.notes.map((n) => `ℹ️ ${h(n)}`);
       const rule = mine?.rules[r.base];
       const levels = rule ? [rule.tp ? `TP ${fmtPrice(rule.tp)}` : "", rule.sl ? `SL ${fmtPrice(rule.sl)}` : ""].filter(Boolean).join(" · ") : "";
@@ -960,10 +981,15 @@ export class Bot {
     });
     const warns = reports.reduce((n, r) => n + r.lines.filter((l) => l.level === "warn").length, 0);
     const count = reports.reduce((n, r) => n + r.lines.length, 0);
+    // Stay well under Telegram's 4,096 characters: whole markets only (a cut never lands inside a tag).
+    const kept: string[] = [];
+    let size = 0;
+    for (const p of parts) { if (size + p.length > LIMITS.stopsMsgBudget) break; kept.push(p); size += p.length + 2; }
+    if (kept.length < parts.length) kept.push(`… and ${parts.length - kept.length} more market${parts.length - kept.length === 1 ? "" : "s"} (the dreamDEX app lists them all).`);
     await this.say(chat,
       `<b>Chain-held stops</b> for ${addrLink(target)}\n` +
       `dreamDEX TP/SL live in each market's stop registry on chain. The chain checks them and fires them itself, even when no bot is running. This bot reads them and checks that each one will close what you expect.\n\n` +
-      (parts.length ? parts.join("\n\n") : "No open positions and no pending chain-held stops.") +
+      (kept.length ? kept.join("\n\n") : "No open positions and no pending chain-held stops.") +
       `\n\n${count} chain-held stop${count === 1 ? "" : "s"}, ${warns} warning${warns === 1 ? "" : "s"} · checked ${new Date().toISOString().slice(11, 19)} UTC. Arm or cancel stops in the <a href="${APP_URL}">dreamDEX app</a>.` + lagNote);
   }
 
@@ -973,36 +999,45 @@ export class Bot {
     this.stopChecking = true;
     try {
       const now = Date.now();
-      const users = this.store.all().filter((x) => x.owner && !x.blockedAt).slice(0, LIMITS.stopCheckUsersMax);
+      const all = this.store.all().filter((x) => x.owner && !x.blockedAt);
+      // More linked users than one pass takes: rotate, so everyone is checked every few passes.
+      if (this.stopCursor >= all.length) this.stopCursor = 0;
+      const users = [...all.slice(this.stopCursor), ...all.slice(0, this.stopCursor)].slice(0, LIMITS.stopCheckUsersMax);
+      this.stopCursor += users.length;
+      // ONE getLogs for every account in this pass: stops armed while the indexer lags.
+      const found = await this.venue.recentStopIds(users.map((x) => x.owner!)).catch(() => undefined);
+      for (const [o, refs] of found ?? []) this.addRecent(o, refs);
       for (const u of users) {
         const owner = u.owner!;
-        const found = await this.venue.recentStopIds(owner).catch(() => undefined);
-        if (found?.length) this.addRecent(owner, found);
         let r: Awaited<ReturnType<Bot["stopReports"]>>;
-        try { r = await this.stopReports(owner); } catch { continue; }
+        try { r = await this.stopReports(owner, { fresh: true, withLogs: true }); } catch { continue; }
         if (u.owner !== owner) continue; // relinked while reading
         const warned = u.stopWarned ?? {};
+        const before = JSON.stringify(warned);
         for (const k of Object.keys(warned)) if (now - warned[k]! > LIMITS.stopWarnRepeatMs) delete warned[k];
-        let changed = false;
         for (const rep of r.reports) {
           const fresh = rep.lines.filter((l) => l.level === "warn" && !warned[warnKey(l)]);
           if (!fresh.length) continue;
-          for (const l of fresh) warned[warnKey(l)] = now;
-          changed = true;
-          // One message per market, however many of its stops have a new problem.
-          await this.say(u.id, `⚠️ <b>Stop health</b> · ${rep.base}-PERP\n${fresh.map((l) => `${h(l.text)}.`).join("\n")}`, [[{ text: "Show my stops", callback_data: "sk" }]]);
+          // One message per market; marked as sent only once Telegram accepted it (a failed send is retried next pass).
+          const shown = fresh.slice(0, LIMITS.stopLinesPerMarket);
+          const more = fresh.length - shown.length;
+          const ok = await this.say(u.id, `⚠️ <b>Stop health</b> · ${rep.base}-PERP\n${shown.map((l) => `${h(l.text)}.`).join("\n")}${more ? `\n… and ${more} more: /stops` : ""}`, [[{ text: "Show my stops", callback_data: "sk" }]]);
+          if (ok) for (const l of fresh) warned[warnKey(l)] = now;
         }
         const keys = Object.keys(warned);
         if (keys.length > LIMITS.stopWarnedMax) for (const k of keys.sort((a, b) => warned[a]! - warned[b]!).slice(0, keys.length - LIMITS.stopWarnedMax)) delete warned[k];
-        if (changed || u.stopWarned !== warned) { u.stopWarned = warned; this.store.save(); }
-        // Stops that left PENDING since the last pass: fired, dropped or cancelled.
-        const prev = this.stopSeen.get(u.id);
-        const cur = new Map(r.stops.map((x) => [x.id, { base: x.base, kind: x.isBid ? (x.op === 1 ? "TP" : "SL") : (x.op === 0 ? "TP" : "SL"), trigger: x.trigger }]));
-        this.stopSeen.set(u.id, cur);
+        if (JSON.stringify(warned) !== before || !u.stopWarned) { u.stopWarned = warned; this.store.save(); }
+        // Reduce-only stops that left PENDING since the last pass on THIS account: fired, dropped or cancelled.
+        const seenKey = `${u.id}:${owner.toLowerCase()}`;
+        for (const k of [...this.stopSeen.keys()]) if (k.startsWith(`${u.id}:`) && k !== seenKey) this.stopSeen.delete(k); // relinked: old account's stops are not news
+        const prev = this.stopSeen.get(seenKey);
+        const cur = new Map(r.stops.filter((x) => x.reduceOnly).map((x) => [x.id, { base: x.base, kind: x.isBid ? (x.op === 1 ? "TP" : "SL") : (x.op === 0 ? "TP" : "SL"), trigger: x.trigger }]));
+        this.stopSeen.set(seenKey, cur);
         if (!prev) continue;
         const gone = [...prev].filter(([id]) => !cur.has(id));
         if (gone.length) await this.stopsEnded(u, owner, gone).catch((e) => log("stop end lookup failed", String(e).slice(0, 120)));
       }
+      if (this.stopSeen.size > 4 * LIMITS.stopCheckUsersMax) this.stopSeen.clear();
     } finally { this.stopChecking = false; }
   }
 
@@ -1022,7 +1057,7 @@ export class Bot {
       if (!r) continue; // not indexed yet, or cancelled by the owner long ago: nothing to say
       if (r.status === "TRIGGERED") await this.say(u.id, `✅ Your ${what} fired: the chain placed its closing order by itself. /positions shows what is left.`);
       else if (r.status === "TRIGGER_FAILED") {
-        const why = Bot.DROP_TEXT[String(r.dropReason)] ?? "it was dropped";
+        const why = Object.hasOwn(Bot.DROP_TEXT, String(r.dropReason)) ? Bot.DROP_TEXT[String(r.dropReason)]! : "it was dropped";
         await this.say(u.id, `⚠️ Your ${what} fired but placed nothing: ${why}. Its fee is spent. Check /stops.`);
       } else if (r.status === "CANCELLED" && r.cancelReason === "LinkedFill") {
         await this.say(u.id, `Your ${what} was cancelled because its linked partner filled. If that fill was only partial, the rest of the position has no chain-held stop now: /stops.`);
