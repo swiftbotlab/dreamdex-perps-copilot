@@ -18,7 +18,7 @@ Live on Somnia Tokyo testnet: [@SwiftPerpsBot](https://t.me/SwiftPerpsBot). Buil
 Then `/start`, Link a bot in the app, and `/long ETH 20 5x tp 4% sl 2%`.
 
 <!-- evidence:headline -->
-**Evidence.** 37 real orders sent by the bot, 37 verified `success` on chain, 9 of them exits the bot fired by itself, on 3 days (newest 2026-10-29 06:08 UTC); scheduled demo trades keep adding three a day until Nov 1. Latest measured time from the pushed mark crossing a TP/SL level to the confirmed close: 2.5 s.
+**Evidence.** 37 real orders sent by the bot, 37 verified `success` on chain, 9 of them exits the bot fired by itself, on 3 days (newest 2026-10-29 06:08 UTC); scheduled demo trades keep adding three a day until Nov 15. Latest measured time from the pushed mark crossing a TP/SL level to the confirmed close: 2.5 s.
 <!-- /evidence:headline -->
 - Evidence page (every order re-read from its receipt, the chain-held stop check run step by step): **https://swiftbotlab.github.io/dreamdex-perps-copilot/**
 - **Chain-fired stop-loss, live:** with the bot process stopped, Somnia Reactivity woke our ExitGuard contract on the demo account (an EIP-7702 account) and it closed the bot-opened HYPE long by itself. [How and the tx hashes](#chain-fired-stop-loss-exitguard).
