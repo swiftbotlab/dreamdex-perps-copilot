@@ -1,12 +1,12 @@
 {
- "generated": "2026-10-29T01:25:43.963Z",
+ "generated": "2026-10-29T02:15:17.785Z",
  "chainId": 50383,
  "accounts": [
   "0x2a11e7388d1d2f9690f2636846d44b478f61bf08",
   "0x0e7e8df6eac2e14165b4fa4cb2bd4e445d0e3817"
  ],
- "verified": 32,
- "total": 32,
+ "verified": 34,
+ "total": 34,
  "orders": [
   {
    "time": "2026-10-20T13:43:08Z",
@@ -647,6 +647,46 @@
    "gasUsed": 1819518,
    "triggerToCloseS": null,
    "triggerSource": null
+  },
+  {
+   "time": "2026-10-29T02:08:05Z",
+   "logged": "2026-10-29T02:08:05.810Z",
+   "kind": "open",
+   "reason": null,
+   "via": "try",
+   "market": "ETH-PERP",
+   "side": "long",
+   "filled": 0.0052,
+   "avgPrice": 2307.05,
+   "hash": "0x195509016abd538ef75a14878fadf0bb17c1d71bead1439d29937262927aaba7",
+   "block": 35864938,
+   "status": "success",
+   "verified": true,
+   "from": "0xdd5ddd125d6a9b3d4641e5bdb5456e5ec098fb18",
+   "account": "0x2A11e7388D1D2F9690f2636846d44b478f61bF08",
+   "gasUsed": 2294361,
+   "triggerToCloseS": null,
+   "triggerSource": null
+  },
+  {
+   "time": "2026-10-29T02:14:09Z",
+   "logged": "2026-10-29T02:14:09.932Z",
+   "kind": "close",
+   "reason": "stop-loss 2,300.13 reached (mark 2,300.10)",
+   "via": null,
+   "market": "ETH-PERP",
+   "side": "short",
+   "filled": 0.0052,
+   "avgPrice": 2301.86,
+   "hash": "0xa148b523b3cec41ad18b38e038fcad96018607f1dd3e93c59c6f8b1cf3a51d62",
+   "block": 35868579,
+   "status": "success",
+   "verified": true,
+   "from": "0xdd5ddd125d6a9b3d4641e5bdb5456e5ec098fb18",
+   "account": "0x2A11e7388D1D2F9690f2636846d44b478f61bF08",
+   "gasUsed": 1573877,
+   "triggerToCloseS": 2.462,
+   "triggerSource": "push"
   }
  ]
 }

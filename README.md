@@ -9,15 +9,16 @@ Live on Somnia Tokyo testnet: [@SwiftPerpsBot](https://t.me/SwiftPerpsBot). Buil
 
 **Who it is for.** Perps traders who live in Telegram and want to act from their phone in seconds (consumer perps), and anyone who wants a second pair of eyes on an account: `/stops` and `/watch` work on any address, read only (trader tool).
 
-**Try it in three taps, no wallet:**
-1. `/demo`: the bot's own live account, its last orders with tx links, the last bot-fired exit and the live Reactivity streams.
-2. `/stops 0xAnyAccount`: the dreamDEX TP/SL the chain holds for that account, each one checked against the position and the pool's closing capacity.
-3. `/watch 0xAnyAccount`: liquidation pings for any account.
+**Try it, no wallet:**
+1. `/try`: one real order in about 5 seconds on the bot's own testnet sandbox account. 12 USDso, closed by itself at ±0.3 % or within 10 minutes, and you get the tx link and how it ended (2 a day per person).
+2. `/demo`: the bot's own live account, its last orders with tx links, the last bot-fired exit and the live Reactivity streams.
+3. `/stops 0xAnyAccount`: the dreamDEX TP/SL the chain holds for that account, each one checked against the position and the pool's closing capacity.
+4. `/watch 0xAnyAccount`: liquidation pings for any account.
 
 Then `/start`, Link a bot in the app, and `/long ETH 20 5x tp 4% sl 2%`.
 
 <!-- evidence:headline -->
-**Evidence.** 32 real orders sent by the bot, 32 verified `success` on chain, 8 of them exits the bot fired by itself, on 3 days (newest 2026-10-29 01:16 UTC); scheduled demo trades keep adding three a day until Nov 1. Latest measured time from the pushed mark crossing a TP/SL level to the confirmed close: 3.4 s.
+**Evidence.** 34 real orders sent by the bot, 34 verified `success` on chain, 9 of them exits the bot fired by itself, on 3 days (newest 2026-10-29 02:14 UTC); scheduled demo trades keep adding three a day until Nov 1. Latest measured time from the pushed mark crossing a TP/SL level to the confirmed close: 2.5 s.
 <!-- /evidence:headline -->
 - Evidence page (every order re-read from its receipt, the chain-held stop check run step by step): **https://swiftbotlab.github.io/dreamdex-perps-copilot/**
 - Order table: [evidence/orders.md](evidence/orders.md) · [CSV](evidence/orders.csv) · [JSON](evidence/orders.json)
@@ -25,7 +26,7 @@ Then `/start`, Link a bot in the app, and `/long ETH 20 5x tp 4% sl 2%`.
 
 | Judging criterion | Where to look |
 |---|---|
-| MVP potential: user value, scope, repeat-use loop, execution | [Two layers of protection](#two-layers-of-protection), [Loops](#loops), [Reliability](#reliability), [Architecture](#architecture), 130 tests |
+| MVP potential: user value, scope, repeat-use loop, execution | [Two layers of protection](#two-layers-of-protection), [Loops](#loops), [Reliability](#reliability), [Architecture](#architecture), 136 tests |
 | Evidence of building: live orders, tx hashes, repo, demo | [Evidence page](https://swiftbotlab.github.io/dreamdex-perps-copilot/), [Evidence](#evidence-real-orders-on-somnia-tokyo-testnet), the video |
 | Communication: X posts | [X posts](#x-posts) |
 
@@ -47,7 +48,7 @@ Live run on 2026-10-29 (account `0x2A11…bF08`, every step on the [evidence pag
 - **Liquidation alerts, and a guard.** A warning with *Close 50%* / *Close all* buttons when the mark comes within your distance of the liquidation price (`/alerts 10`). `/guard 3` closes the position for you when it gets within 3 %.
 - **Cards friends can copy.** `/card` renders an image of the trade (with a mark-price sparkline). Forward it anywhere: **Copy this trade** opens a landing with the trade, the mark now and the move since entry, then a 10 / 25 / 50 USDso preview and a single-use Confirm (optionally with a 3 % stop-loss). The copy is a one-time order on the copier's own account, never filled more than 0.5 % from the mark.
 - **Watch any account.** `/watch 0x…` warns once when a position on that account nears liquidation (again only if it gets twice as close) and says when a warned position is gone. Every alert offers **Guard it: link this account**.
-- **A demo for anyone.** `/demo` shows the bot's own live account and its recent orders before you link anything.
+- **A demo for anyone.** `/demo` shows the bot's own live account and its recent orders before you link anything, and `/try` places one real, capped order on that sandbox account for anyone, with no wallet (it closes itself within 10 minutes).
 
 ## Loops
 
@@ -81,6 +82,7 @@ You never give the bot your wallet. On `/start` the bot generates a **personal b
 
 | Command | What it does |
 |---|---|
+| `/try` | One real order on the bot's own testnet sandbox account, no wallet: 12 USDso, closed by itself within 10 minutes; 2 a day per person, 12 a day in total |
 | `/demo` | A live account run by this bot: equity, positions, last orders with tx links, live streams, chain link. No wallet needed |
 | `/stops` / `/stops 0x…` | The dreamDEX TP/SL the chain holds for your account (or any account, read only), each checked against the position and the pool's closing capacity |
 | `/watch 0x…` / `/unwatch` | Liquidation pings for any account, read only (up to 3; they end after 7 days without a message from you) |
@@ -116,14 +118,16 @@ All orders were placed **by the bot**, through a bot key linked to the account w
 Accounts: from 2026-10-29 the demo account is `0x2A11e7388D1D2F9690f2636846d44b478f61bF08`, an account outside the Perps Arena holding testnet USDso bought with faucet STT. The orders of 2026-10-20 and 2026-10-26 went to the earlier demo account `0x0e7E8DF6Eac2E14165b4fA4CB2BD4e445d0E3817` (paper USDso from its own airdrop); `/demo` counts both.
 
 <!-- evidence:summary -->
-32 orders (16 opens, 16 closes), 32/32 verified `success`: 24 on 2026-10-20, 4 on 2026-10-26, 4 on 2026-10-29. 8 closes were fired by the bot itself (take-profit, stop-loss or guard). All of them are on our own demo accounts; the bot has had no outside users yet. Generated 2026-10-29 01:25 UTC.
+34 orders (17 opens, 17 closes), 34/34 verified `success`: 24 on 2026-10-20, 4 on 2026-10-26, 6 on 2026-10-29. 9 closes were fired by the bot itself (take-profit, stop-loss or guard). All of them are on our own demo accounts; the bot has had no outside users yet. Generated 2026-10-29 02:15 UTC.
 <!-- /evidence:summary -->
 
 <!-- evidence:latest -->
-Newest 10 (all 32 in [evidence/orders.md](evidence/orders.md)):
+Newest 10 (all 34 in [evidence/orders.md](evidence/orders.md)):
 
 | UTC | action | market | filled | avg price | tx | status | trigger to close |
 |---|---|---|---|---|---|---|---|
+| 10-29 02:14 | close, stop-loss (bot) | ETH-PERP short | 0.0052 | 2301.86 | [`0xa148b523…`](https://explorer.testnet.somnia.network/tokyo/tx/0xa148b523b3cec41ad18b38e038fcad96018607f1dd3e93c59c6f8b1cf3a51d62) | success | 2.5 s |
+| 10-29 02:08 | open | ETH-PERP long | 0.0052 | 2307.05 | [`0x19550901…`](https://explorer.testnet.somnia.network/tokyo/tx/0x195509016abd538ef75a14878fadf0bb17c1d71bead1439d29937262927aaba7) | success |  |
 | 10-29 01:16 | close | XRP-PERP short | 9.1 | 1.3173 | [`0x2e6d136d…`](https://explorer.testnet.somnia.network/tokyo/tx/0x2e6d136d76c96a6ee7e79d711d0fb7cfab8c8cea9b8dc3c764c1a3ffae275c79) | success |  |
 | 10-29 01:05 | open | XRP-PERP long | 9.1 | 1.3183 | [`0x4f70e96e…`](https://explorer.testnet.somnia.network/tokyo/tx/0x4f70e96e3db40293c1f44a96c516ab1ef9f72b07c396047766da437416fb424a) | success |  |
 | 10-29 01:03 | close, stop-loss (bot) | XRP-PERP short | 9 | 1.3168 | [`0x4c443a40…`](https://explorer.testnet.somnia.network/tokyo/tx/0x4c443a40c1bf3cecb975e6a2bc6c29ee57238f36f7a1af87da46d3ef586f91b8) | success | 3.4 s |
@@ -132,8 +136,6 @@ Newest 10 (all 32 in [evidence/orders.md](evidence/orders.md)):
 | 10-26 02:18 | open | SOL-PERP long | 0.49 | 101.14 | [`0xd08da31b…`](https://explorer.testnet.somnia.network/tokyo/tx/0xd08da31b0a328b6e9eb84817a99ef74b1e8431471737e3835d91b5dac403dee5) | success |  |
 | 10-26 02:18 | close | ETH-PERP short | 0.0432 | 2311.33 | [`0x74ff2f03…`](https://explorer.testnet.somnia.network/tokyo/tx/0x74ff2f03338caa120fddfc49cf11425ea589d7ff5d1f08dd28cf565d7d012969) | success |  |
 | 10-26 02:14 | open, card copy | ETH-PERP long | 0.0432 | 2309.53 | [`0x887ca266…`](https://explorer.testnet.somnia.network/tokyo/tx/0x887ca26690b163b68f7b9066c41a015152c05aab9646c91acd28cc5b97b0dbd7) | success |  |
-| 10-20 14:19 | close | ETH-PERP short | 1.6271 | 2460.91 | [`0x53f1f7f7…`](https://explorer.testnet.somnia.network/tokyo/tx/0x53f1f7f7f5efbe2fecfab50c4cfc9e24cff200bc7eb7c92dc1d818824897b9b5) | success |  |
-| 10-20 14:19 | open | ETH-PERP long | 1.6271 | 2458.218 | [`0x426548fd…`](https://explorer.testnet.somnia.network/tokyo/tx/0x426548fd875ff6c74f82b5c18bc1835170d0bc35d1af94d92295e0abb42d15dc) | success |  |
 <!-- /evidence:latest -->
 
 ### Card copy evidence (live, 2026-10-26)
@@ -185,7 +187,7 @@ Requirements: Node 22, a Telegram bot token, Linux with `bwrap` for the jail (op
 ```bash
 git clone https://github.com/swiftbotlab/dreamdex-perps-copilot && cd dreamdex-perps-copilot
 npm ci --ignore-scripts
-npm test                      # 130 tests: parsing, key vault, card, protection, close races, send outcomes, card copies, /watch, /demo, /stops, watchdog, schedule, /try
+npm test                      # 136 tests: parsing, key vault, card, protection, close races, send outcomes, card copies, /watch, /demo, /stops, watchdog, schedule, /try
 npm run build                 # bundles dist/bot.mjs + dist/resvg.wasm
 
 # secrets live outside the repo, one KEY=VALUE per line, chmod 600

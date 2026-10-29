@@ -117,6 +117,23 @@
   three slots a day, never repeated after a restart (the slot is recorded before the order); skipped
   below 2.8 USDso equity; off after 2026-11-02 or while `data/demo_schedule.off` exists.
 
+## Live trials (`/try`)
+- Anyone can tap Long/Short on ETH, SOL or XRP and the bot opens one 12 USDso position (2.4 x 5x) on its own
+  testnet sandbox account (the demo account), through the normal open path, refused when the book is more than
+  0.15 % from the mark, with a quiet bot-side TP/SL 0.3 % away. The trier needs no record, key or wallet and can
+  only choose market and side: size, leverage and account are fixed.
+- Caps: 2 trials per Telegram id and 12 in total per UTC day, a 30 s cooldown per person, 4 per minute in total,
+  one position per market and at most 2 open, a 3.0 USDso equity floor (above the scheduled trades' 2.8) and a
+  1 STT gas floor. Busy markets are refused from memory before any chain read; the caps are checked and counted
+  under one sandbox-wide lock, and again under the account+market lock right before the send. No trials from
+  minute 15 of a scheduled slot hour until that slot ran, nor while a scheduled trade is open.
+- Every trial and scheduled trade is a job in `data/sandbox_jobs.json` (0600), written before the send. A sweep
+  every minute and after each restart closes it after its hold time, retries failed closes, keeps a partly filled
+  close for the rest, and closes nothing but the job's own position (same side and size; the owner's own opens on
+  such a market are refused). The trier's chat id is kept there and in `data/try.json` only; never in logs, the
+  order log or the evidence. On only while `data/try.on` exists; `data/try.off` turns it off.
+- Reviewed twice before it was switched on (2026-10-29); every finding fixed with a test.
+
 ## Send outcomes
 - Every order send is labelled by the step that failed: the simulation or the preparation (nonce, fee
   and chain-id reads, local signing; nothing was posted), the post of the signed transaction, the

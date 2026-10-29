@@ -102,6 +102,7 @@ footer { margin-top:40px; color:var(--mut); font-size:.85rem; }
 
 <h2>Try it in 60 seconds</h2>
 <ol class="try">
+<li><code>/try</code>: one real order in about 5 seconds on the bot's own testnet sandbox account. 12 USDso, closed by itself within 10 minutes; you get the tx link.</li>
 <li><code>/demo</code>: the bot's own live account, its last orders with tx links and the live Reactivity streams. No wallet needed.</li>
 <li><code>/stops 0xAnyAccount</code>: the dreamDEX TP/SL the chain holds for that account, and whether each one will close what it should. Read only.</li>
 <li><code>/watch 0xAnyAccount</code>: liquidation pings for any account. Read only.</li>
