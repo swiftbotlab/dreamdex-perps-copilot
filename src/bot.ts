@@ -148,6 +148,7 @@ export class Bot {
     await this.tg.setMyCommands([
       { command: "start", description: "Set up: link your bot key" },
       { command: "demo", description: "See a live account, no wallet needed" },
+      ...(this.tryEnabled() ? [{ command: "try", description: "One real order on our sandbox, no wallet" }] : []),
       { command: "watch", description: "Liquidation pings for any account" },
       { command: "long", description: "Open long: /long ETH 20 5x" },
       { command: "short", description: "Open short: /short BTC 20 3x" },
@@ -443,13 +444,14 @@ export class Bot {
       `3. Keep USDso in your <b>Perps</b> balance (Perps Arena paper USDso works).\n` +
       `4. Press <b>I've linked it</b>.\n\n` +
       `The key can place and close orders for your account. It <b>cannot withdraw or move funds</b>; remove it in the app any time.` + linked,
-      [[{ text: "Open dreamDEX", url: APP_URL }], [{ text: "I've linked it", callback_data: "chk" }]]);
+      [[{ text: "Open dreamDEX", url: APP_URL }], [{ text: "I've linked it", callback_data: "chk" }], ...(this.tryEnabled() ? [[{ text: "First, try a real order (no wallet)", callback_data: "tr" }]] : [])]);
   }
 
   private async cmdHelp(chat: number): Promise<void> {
     await this.say(chat,
       `<b>Commands</b>\n` +
       `/demo  a live account run by this bot (no wallet needed)\n` +
+      (this.tryEnabled() ? `/try  one real order in seconds on the bot's sandbox account (no wallet)\n` : "") +
       `<code>/watch 0xAccount</code>  liquidation pings for any account, read only (/unwatch)\n` +
       `<code>/long ETH 20 5x</code> market long: 20 USDso margin at 5x = 100 USDso position\n` +
       `<code>/short BTC 15 10x tp 3% sl 1.5%</code> short with take-profit and stop-loss\n` +
@@ -605,7 +607,7 @@ export class Bot {
       `\n<b>Totals</b>: ${t.orders} orders (${t.opens} opens, ${t.closes} closes), ${t.autoExits} closed by the bot itself (take-profit, stop-loss or guard)${t.unknown ? `, ${t.unknown} not confirmed at send` : ""}${hist.length ? `; including the earlier demo account${hist.length === 1 ? "" : "s"} ${hist.map((a) => addrLink(getAddress(a))).join(", ")}` : ""}.\n` +
       `<b>Somnia Reactivity</b>: ${w.length} live mark stream${w.length === 1 ? "" : "s"}${w.length ? ` (${w.map((x) => `${x.base} ${x.pushes} pushes`).join(", ")})` : ""}.\n` +
       `${this.linkLine()}.`,
-      [[{ text: "Sample PnL card", callback_data: "dc" }], [{ text: "Watch this account", callback_data: "wd" }, { text: "Its chain-held stops", callback_data: "sd" }], [{ text: "Start trading", callback_data: "st" }]]);
+      [[{ text: "Sample PnL card", callback_data: "dc" }], [{ text: "Watch this account", callback_data: "wd" }, { text: "Its chain-held stops", callback_data: "sd" }], ...(this.tryEnabled() ? [[{ text: "Try a real order (no wallet)", callback_data: "tr" }]] : []), [{ text: "Start trading", callback_data: "st" }]]);
   }
 
   private async demoCard(viewer: number, chat: number): Promise<void> {
@@ -1526,6 +1528,7 @@ export class Bot {
       if (data === "wd") { const r = await this.ensureUser(q.from.id, chat, { key: false }); if (r) await this.cmdWatch(r.user, chat, this.demoAccount); return; }
       if (data === "sk") { await this.cmdStops(q.from.id, chat); return; }
       if (data === "sd") { await this.cmdStops(q.from.id, chat, this.demoAccount); return; }
+      if (data === "tr") { await this.cmdTry(chat); return; }
       const ty = /^ty:(ETH|SOL|XRP):([ls])$/.exec(data);
       if (ty) { await this.tryOrder(q.from.id, chat, ty[1]!, ty[2] === "l" ? "long" : "short"); return; }
       const wu = this.store.get(q.from.id);

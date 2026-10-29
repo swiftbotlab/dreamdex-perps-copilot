@@ -127,3 +127,16 @@ test("TR6: the trier hears how the trial ended: by its exit, or after the hold t
   await h.bot.sandboxSweep();
   assert.match(h.to(721).at(-1)!.html, /Your SOL-PERP trial has ended|Your SOL-PERP trial is closed/);
 });
+
+test("TR7: entry points appear only when trials are on: /demo and /start buttons, and the tr button opens the picker", async () => {
+  const off = setup(false);
+  await off.h.handle(msg(730, "/demo"));
+  assert.ok(!off.h.cbData(off.h.to(730).at(-1)).includes("tr"));
+  const { h } = setup();
+  await h.handle(msg(731, "/demo"));
+  assert.ok(h.cbData(h.to(731).at(-1)).includes("tr"));
+  await h.handle(msg(732, "/start"));
+  assert.ok(h.cbData(h.to(732).at(-1)).includes("tr"));
+  await h.handle(cb(733, "tr"));
+  assert.deepEqual(h.cbData(h.to(733).at(-1)), ["ty:ETH:l", "ty:ETH:s", "ty:SOL:l", "ty:SOL:s", "ty:XRP:l", "ty:XRP:s"]);
+});
