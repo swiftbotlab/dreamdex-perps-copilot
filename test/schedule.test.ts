@@ -64,7 +64,7 @@ test("SC3: flatten closes a scheduled position still open, quietly; a quiet rule
   const { h, u, closes } = setup();
   await h.bot.demoScheduleTick(at("2026-10-29T03:25:00Z"));
   const { base, side } = h.state.opens[0]!;
-  await h.bot.scheduledFlatten(u, base, side);
+  await h.bot.scheduledFlatten(u, base, side, h.bot.sandboxPos.get(base));
   assert.deepEqual(closes, [base]);
   assert.equal(h.sent.length, 0);
   // next slot, the TP fires through autoClose: still silent, logged as a bot exit

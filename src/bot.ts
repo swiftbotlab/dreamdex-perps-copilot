@@ -86,6 +86,9 @@ export class Bot {
   private stopCache = new Map<string, { at: number; v: Awaited<ReturnType<Bot["stopReportsUncached"]>> }>();
   private stopChecking = false;
   private tryCaps = new TryCaps(`${PATHS.data}/try.json`);
+  /** Sandbox (demo account) positions opened by a trial or a scheduled trade: market -> the open's tx hash. A
+   *  delayed close acts only if the position there is still the one it opened (never a later one). */
+  private sandboxPos = new Map<string, string>();
   /** Stop ids found in the registries' own logs (newer than the indexer), per owner (lowercase), kept 15 minutes. */
   private stopLogs = new Map<string, Map<string, { ref: { registry: `0x${string}`; orderId: string }; at: number }>>();
 
@@ -899,12 +902,15 @@ export class Bot {
     });
     if (typeof r === "string") return r;
     if (!r || r.filledBase === 0) return `skip: nothing filled on ${base}`;
-    setTimeout(() => void this.scheduledFlatten(u, base, side).catch((e) => log("scheduled flatten failed", base, String(e).slice(0, 160))), S.maxHoldMs).unref();
+    this.sandboxPos.set(base, r.hash);
+    setTimeout(() => void this.scheduledFlatten(u, base, side, r.hash).catch((e) => log("scheduled flatten failed", base, String(e).slice(0, 160))), S.maxHoldMs).unref();
     return `opened ${side} ${base} ${r.filledBase} (tx ${r.hash})`;
   }
 
   /** The scheduled position is still open after maxHoldMs (neither TP nor SL fired): close it at market, quietly. */
-  async scheduledFlatten(u: User, base: string, side: Side): Promise<void> {
+  async scheduledFlatten(u: User, base: string, side: Side, token: string): Promise<void> {
+    if (this.sandboxPos.get(base) !== token) return; // closed meanwhile and something else opened there: not ours
+    this.sandboxPos.delete(base);
     if (u.owner?.toLowerCase() !== this.demoAccount.toLowerCase()) return;
     const pos = (await this.venue.account(u.owner)).positions.find((x) => x.base === base);
     if (!pos || pos.side !== side) return;
@@ -950,20 +956,24 @@ export class Bot {
     });
     if (!r || r.filledBase === 0) { await this.say(chat, `Nothing filled (the book moved)${r ? `: tx ${txLink(r.hash)}` : ""}. No position was opened.`); return; }
     const at = Date.now();
+    this.sandboxPos.set(base, r.hash);
     await this.say(chat,
       `<b>Filled</b> ${side} ${r.filledBase} ${base} @ ${r.avgPrice ? fmtPrice(r.avgPrice) : "?"} on the sandbox account ${addrLink(tk.owner)}\nTx ${txLink(r.hash)}\n` +
       `It closes by itself at ±${TRY.tpPct}% or within ${Math.round(TRY.maxHoldMs / 60_000)} minutes; I tell you how it ended. To trade your own account: /start.`,
       [[{ text: "Start trading", callback_data: "st" }]]);
-    setTimeout(() => void this.tryEnded(u, chat, base, side, at).catch((e) => log("trial end failed", base, String(e).slice(0, 160))), TRY.maxHoldMs).unref();
+    setTimeout(() => void this.tryEnded(u, chat, base, side, at, r.hash).catch((e) => log("trial end failed", base, String(e).slice(0, 160))), TRY.maxHoldMs).unref();
   }
 
   /** maxHoldMs after a trial: close it if no exit fired, then tell the trier how it ended (from the order log). */
-  private async tryEnded(u: User, chat: number, base: string, side: Side, at: number): Promise<void> {
-    if (u.owner?.toLowerCase() === this.demoAccount.toLowerCase()) {
+  private async tryEnded(u: User, chat: number, base: string, side: Side, at: number, token: string): Promise<void> {
+    const mine = this.sandboxPos.get(base) === token;
+    if (mine) this.sandboxPos.delete(base);
+    if (mine && u.owner?.toLowerCase() === this.demoAccount.toLowerCase()) {
       const pos = (await this.venue.account(u.owner)).positions.find((x) => x.base === base);
       if (pos && pos.side === side) await this.doClose(u, 0, base, 1, `trial closed after ${Math.round(TRY.maxHoldMs / 60_000)} min`, { expectSide: side, auto: true }).catch(() => undefined);
     }
-    const close = this.store.recentOrders(this.demoAccount, 20).find((x) => x.kind === "close" && x.market === `${base}-PERP` && Date.parse(x.t) >= at);
+    // The first close on that market after this trial opened is this trial's (one position per market at a time).
+    const close = this.store.recentOrders(this.demoAccount, 20).filter((x) => x.kind === "close" && x.market === `${base}-PERP` && Date.parse(x.t) >= at).at(-1);
     await this.say(chat, close
       ? `Your ${base}-PERP trial is closed${close.avgPrice !== undefined ? ` @ ${fmtPrice(close.avgPrice)}` : ""}${autoKind(close.reason) ? ` by its ${autoKind(close.reason)}` : ""}. Tx ${txLink(close.hash)}`
       : `Your ${base}-PERP trial: I could not confirm the close yet. /demo shows the sandbox account.`);

@@ -94,7 +94,21 @@ test("TR4: the global daily cap holds; unreadable cap state refuses (fail closed
 test("TR5: after the hold time the trial is flattened and the trier hears how it ended", async () => {
   const { h, owner } = setup();
   await h.handle(cb(720, "ty:XRP:l"));
-  await h.bot.tryEnded(owner, 720, "XRP", "long", Date.now() - 1000);
+  const token = h.bot.sandboxPos.get("XRP");
+  await h.bot.tryEnded(owner, 720, "XRP", "long", Date.now() - 1000, token);
   assert.equal((h.state.positions.get(DEMO.toLowerCase()) ?? []).length, 0);
   assert.match(h.to(720).at(-1)!.html, /Your XRP-PERP trial is closed @ 101\.000\. Tx <a href=/);
+});
+
+test("TR6: a delayed close never touches a later position on the same market (trial closed early, then the schedule opened there)", async () => {
+  const { h, owner } = setup();
+  await h.handle(cb(730, "ty:XRP:l"));
+  const trialToken = h.bot.sandboxPos.get("XRP");
+  h.state.positions.clear();                       // the trial's TP fired
+  h.bot.sandboxPos.set("XRP", `0x${"ee".repeat(32)}`); // a later open on XRP (e.g. the schedule)
+  h.state.positions.set(DEMO.toLowerCase(), [{ base: "XRP", side: "long", size: 9, entry: 100 }]);
+  await h.bot.tryEnded(owner, 730, "XRP", "long", Date.now() - 1000, trialToken);
+  assert.equal((h.state.positions.get(DEMO.toLowerCase()) ?? []).length, 1, "the later position is untouched");
+  await h.bot.scheduledFlatten(owner, "XRP", "long", trialToken);
+  assert.equal((h.state.positions.get(DEMO.toLowerCase()) ?? []).length, 1, "same for the schedule's flatten");
 });
