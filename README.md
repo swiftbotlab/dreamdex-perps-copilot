@@ -21,11 +21,11 @@ Then `/start`, Link a bot in the app, and `/long ETH 20 5x tp 4% sl 2%`.
 <!-- /evidence:headline -->
 - Evidence page (every order re-read from its receipt, the chain-held stop check run step by step): **https://swiftbotlab.github.io/dreamdex-perps-copilot/**
 - Order table: [evidence/orders.md](evidence/orders.md) · [CSV](evidence/orders.csv) · [JSON](evidence/orders.json)
-- Demo video (112 s): [demo.mp4 on the v1.0.0 release](https://github.com/swiftbotlab/dreamdex-perps-copilot/releases/download/v1.0.0/demo.mp4) (recorded 2026-10-20: orders, a bot-fired stop-loss, a liquidation alert, `/card`)
+- Demo video (112 s, YouTube): https://youtu.be/rWLEHY_x_j4 (recorded 2026-10-20: orders, a bot-fired stop-loss, a liquidation alert, `/card`; also as [demo.mp4 on the v1.0.0 release](https://github.com/swiftbotlab/dreamdex-perps-copilot/releases/download/v1.0.0/demo.mp4))
 
 | Judging criterion | Where to look |
 |---|---|
-| MVP potential: user value, scope, repeat-use loop, execution | [Two layers of protection](#two-layers-of-protection), [Loops](#loops), [Reliability](#reliability), [Architecture](#architecture), 124 tests |
+| MVP potential: user value, scope, repeat-use loop, execution | [Two layers of protection](#two-layers-of-protection), [Loops](#loops), [Reliability](#reliability), [Architecture](#architecture), 130 tests |
 | Evidence of building: live orders, tx hashes, repo, demo | [Evidence page](https://swiftbotlab.github.io/dreamdex-perps-copilot/), [Evidence](#evidence-real-orders-on-somnia-tokyo-testnet), the video |
 | Communication: X posts | [X posts](#x-posts) |
 
@@ -185,7 +185,7 @@ Requirements: Node 22, a Telegram bot token, Linux with `bwrap` for the jail (op
 ```bash
 git clone https://github.com/swiftbotlab/dreamdex-perps-copilot && cd dreamdex-perps-copilot
 npm ci --ignore-scripts
-npm test                      # 124 tests: parsing, key vault, card, protection, close races, send outcomes, card copies, /watch, /demo, /stops, watchdog, schedule
+npm test                      # 130 tests: parsing, key vault, card, protection, close races, send outcomes, card copies, /watch, /demo, /stops, watchdog, schedule, /try
 npm run build                 # bundles dist/bot.mjs + dist/resvg.wasm
 
 # secrets live outside the repo, one KEY=VALUE per line, chmod 600
