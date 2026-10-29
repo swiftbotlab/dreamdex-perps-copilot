@@ -28,6 +28,7 @@ export interface User {
   watches?: { addr: `0x${string}`; at: number }[];       // read-only liquidation watches (/watch)
   blockedAt?: number;                                     // Telegram said the user blocked the bot
   lastSeen?: number;                                      // last message or button press (watches expire without one)
+  stopWarned?: Record<string, number>;                    // stop-health warnings already sent (key -> time), capped
 }
 
 /** A shared PnL card. `by` (the sharer's Telegram id) never leaves the bot; landings show only the trade. */
@@ -40,6 +41,8 @@ export interface CardRec {
 export interface OrderRow {
   t: string; kind: "open" | "close" | "unknown"; reason?: string; market: string; side: Side;
   hash: `0x${string}`; filled?: number; avgPrice?: number; via?: string;
+  /** Auto exits: ms from the mark update that crossed the level (`trigAt`) to the confirmed close (`t`). */
+  latencyMs?: number; trigSrc?: "push" | "poll";
 }
 
 interface Db { users: Record<string, User>; keysMadeAt: number[]; cards: Record<string, CardRec>; cardRefs: Record<string, { ref: string; at: number }> }
@@ -67,7 +70,16 @@ export function parseOrderLine(line: string, accountLower: string): OrderRow | u
     filled: typeof r.filled === "number" ? r.filled : undefined,
     avgPrice: typeof r.avgPrice === "number" ? r.avgPrice : undefined,
     via: typeof r.via === "string" ? r.via.slice(0, 12) : undefined,
+    latencyMs: latencyOf(r.t, r.trigAt),
+    trigSrc: r.trigSrc === "push" || r.trigSrc === "poll" ? r.trigSrc : undefined,
   };
+}
+
+/** Trigger-to-confirmed-close time in ms, only for a well-formed trigger stamp 0-120 s before the row. */
+function latencyOf(t: string, trigAt: unknown): number | undefined {
+  if (typeof trigAt !== "string" || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$/.test(trigAt)) return undefined;
+  const ms = Date.parse(t) - Date.parse(trigAt);
+  return Number.isFinite(ms) && ms >= 0 && ms <= 120_000 ? ms : undefined;
 }
 
 /** An exit the bot fired by itself, from the order's reason text. */

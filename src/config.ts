@@ -8,8 +8,14 @@ export const INDEXER_URL = "https://hideki-dev.smk.somnia.host/v1/graphql";
 export const EXPLORER_TX = "https://explorer.testnet.somnia.network/tokyo/tx/";
 export const EXPLORER_ADDR = "https://explorer.testnet.somnia.network/tokyo/address/";
 export const APP_URL = "https://app.testnet.dreamdex.io";
-/** The live account this bot trades for in public (/demo): Perps Arena Wallet 1, paper USDso, testnet. */
-export const DEMO_ACCOUNT = "0x0e7E8DF6Eac2E14165b4fA4CB2BD4e445d0E3817" as const;
+/**
+ * The live account this bot trades for in public (/demo), since 2026-10-29: an EOA account outside the Perps
+ * Arena, holding testnet USDso bought with faucet STT; linked to the bot key with the same per-pool operator
+ * grant the app's Link a bot writes.
+ */
+export const DEMO_ACCOUNT = "0x2A11e7388D1D2F9690f2636846d44b478f61bF08" as const;
+/** Earlier demo accounts whose bot orders still count in /demo's history (Oct 20-26: 0x0e7E…3817). */
+export const DEMO_HISTORY = ["0x0e7E8DF6Eac2E14165b4fA4CB2BD4e445d0E3817"] as const;
 
 const ROOT = process.env.DDMVP_ROOT ?? "/home/agent/agent/products/dreamdex-mvp";
 export const PATHS = {
@@ -63,6 +69,13 @@ export const LIMITS = {
   watchIdleMs: 7 * 24 * 3_600_000,    // watches end after this long without a message from the watcher (they are told)
   watchUsersMax: 1_000,               // watch-only records (no key), separate from maxUsers
   watchWarnMinGapMs: 60_000,          // watched positions: once per position, again only when the distance halves
+  // chain-held stops (/stops) and stop-health alerts
+  stopsPerMinute: 4,
+  stopsGlobalPerMinute: 60,           // all users together (each /stops = 1 indexer read + chain reads)
+  stopCheckMs: 60_000,                // one stop-health pass over linked accounts per minute
+  stopCheckUsersMax: 50,              // accounts per pass (each costs 1 indexer read + 1-2 chain reads per market)
+  stopWarnRepeatMs: 24 * 3_600_000,   // the same warning about the same stop is sent at most once a day
+  stopWarnedMax: 30,
   // chain-link watchdog (src/watchdog.ts): one probe every 30 s; 6 failed in a row = rebuild, 6 more = exit 75
   watchdogMs: 30_000,
   // shutdown

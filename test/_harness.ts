@@ -53,6 +53,10 @@ export function makeBot(opts: { mark?: number; maxLev?: Record<string, number> }
     positions: new Map<string, FakePos[]>(),
     opens: [] as { owner: string; base: string; side: string; notional: number; opts: { maxTouchPct?: number } }[],
     accountCalls: 0,
+    stops: [] as unknown[],
+    cap: undefined as undefined | { position: number; pendingBid: number; pendingAsk: number; effective: number },
+    stopRows: [] as unknown[],
+    lag: 2 as number | undefined,
   };
   const maxLev = opts.maxLev ?? { ETH: 20, SOL: 20, BTC: 20 };
   const market = (b: string) => (POOLS[b] ? { display: `${b}-PERP`, symbol: `${b}/USDso:USDso`, info: { poolAddress: POOLS[b] } } : undefined);
@@ -75,6 +79,12 @@ export function makeBot(opts: { mark?: number; maxLev?: Record<string, number> }
     coverage: async () => ({ linked: ["ETH", "SOL"], missing: [] }),
     tradingKey: (_id: number, owner: string) => ({ owner, operator: OPERATOR }),
     txState: async () => "none",
+    nativeStops: async () => state.stops,
+    recentStopIds: async () => [],
+    indexerLagS: async () => state.lag,
+    reducingCapacity: async () => { if (!state.cap) throw new Error("no capacity"); return state.cap; },
+    minQty: () => 0.001,
+    exchange: { client: { listPerpStopOrders: async () => state.stopRows } },
     forgetKey: () => {},
     reloadMarkets: async () => {},
     open: async (tk: { owner: string }, base: string, side: "long" | "short", notional: number, o: { maxTouchPct?: number }) => {

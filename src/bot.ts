@@ -3,7 +3,7 @@
 // user-supplied reaches a shell, an eval, a file path or an SVG without validation.
 import { createHash, randomBytes } from "node:crypto";
 import { getAddress } from "viem";
-import { APP_URL, CHAIN_NAME, DEMO_ACCOUNT, EXPLORER_ADDR, EXPLORER_TX, LIMITS, PATHS } from "./config.ts";
+import { APP_URL, CHAIN_NAME, DEMO_ACCOUNT, DEMO_HISTORY, EXPLORER_ADDR, EXPLORER_TX, LIMITS, PATHS } from "./config.ts";
 import { renderCard } from "./card.ts";
 import { acquireInstanceLock } from "./instance.ts";
 import { KeyVault, type SealedKey } from "./keys.ts";
@@ -15,6 +15,7 @@ import { autoKind, Store, type CardRec, type OrderRow, type User } from "./store
 import { Telegram, type Button, type TgCallback, type TgMessage, type TgUpdate } from "./tg.ts";
 import { findLinkedOwners, OutcomeUnknown, UserError, Venue, type AccountView, type Position, type TradeResult } from "./venue.ts";
 import { RpcWatchdog } from "./watchdog.ts";
+import { checkMarket, warnKey, type NativeStop, type PositionReport } from "./stops.ts";
 
 const log = (...a: unknown[]) => console.log(new Date().toISOString(), ...a);
 
@@ -67,6 +68,7 @@ export class Bot {
   private drafts = new Map<string, Draft>();
   private tapped = new Set<string>();                 // `${card}:${telegramId}`: a tap counts once per process
   private demoAccount: `0x${string}` = DEMO_ACCOUNT;
+  private demoHistory: string[] = [...DEMO_HISTORY];
   private demoCache?: { account: string; at: number; view: AccountView; orders: OrderRow[]; totals: ReturnType<Store["orderTotals"]> };
   private releaseLock?: () => void;
   private stopping = false;
@@ -75,6 +77,12 @@ export class Bot {
   exitCode = 0;
   readonly watchdog: RpcWatchdog;
   private timers: NodeJS.Timeout[] = [];
+  /** Stop-health alerts: the pending native stops last seen per user, and the warnings already sent (key -> time). */
+  private stopSeen = new Map<number, Map<string, { base: string; kind: string; trigger: number }>>();
+  private stopWarned = new Map<string, number>();
+  private stopChecking = false;
+  /** Stop ids found in the registries' own logs (newer than the indexer), per owner (lowercase), kept 15 minutes. */
+  private stopLogs = new Map<string, Map<string, { ref: { registry: `0x${string}`; orderId: string }; at: number }>>();
 
   constructor() {
     const bot = readEnvFile(PATHS.botEnv);
@@ -132,6 +140,7 @@ export class Bot {
       { command: "short", description: "Open short: /short BTC 20 3x" },
       { command: "close", description: "Close: /close ETH [50%]" },
       { command: "positions", description: "Positions, PnL, liquidation" },
+      { command: "stops", description: "Chain-held TP/SL and their health" },
       { command: "tp", description: "Take-profit: /tp ETH 2500 or 4%" },
       { command: "sl", description: "Stop-loss: /sl ETH 2300 or 2%" },
       { command: "card", description: "Share a PnL card" },
@@ -149,6 +158,7 @@ export class Bot {
     this.protector.start();
     this.timers.push(setInterval(() => void this.watchdogRound().catch((e) => log("watchdog error", String(e).slice(0, 160))), LIMITS.watchdogMs));
     void this.watchdogRound().catch(() => {}); // first check right away, so /status shows a verified link
+    this.timers.push(setInterval(() => void this.stopHealthRound().catch((e) => log("stop check error", String(e).slice(0, 160))), LIMITS.stopCheckMs));
     setInterval(() => void this.housekeeping().catch((e) => log("housekeeping error", String(e).slice(0, 160))), 10 * 60_000).unref();
     await this.poll();
     await this.shutdown();
@@ -274,6 +284,7 @@ export class Bot {
     if (cmd === "help") return this.cmdHelp(chat);
     if (cmd === "markets") return this.cmdMarkets(chat);
     if (cmd === "demo") return this.cmdDemo(id, chat);
+    if (cmd === "stops") return this.cmdStops(id, chat, args[0]);
     if (cmd === "watch" || cmd === "unwatch") {
       // No link and no key needed: watching only reads public chain state. A keyless record holds the watch
       // list, made only for a valid /watch request.
@@ -421,13 +432,14 @@ export class Bot {
       `<code>/long ETH 20 5x</code> market long: 20 USDso margin at 5x = 100 USDso position\n` +
       `<code>/short BTC 15 10x tp 3% sl 1.5%</code> short with take-profit and stop-loss\n` +
       `<code>/close ETH</code> or <code>/close ETH 50%</code>\n` +
-      `/positions  PnL, liquidation price and distance\n` +
+      `/positions  PnL, liquidation price and distance, chain-held TP/SL\n` +
+      `/stops  the dreamDEX TP/SL the chain holds for you, checked (<code>/stops 0x…</code> for any account)\n` +
       `<code>/tp ETH 2500</code>, <code>/sl ETH 2%</code>, <code>/tp ETH off</code>  bot-watched exits\n` +
       `<code>/alerts 10</code> warn when within 10% of liquidation\n` +
       `<code>/guard 3</code> auto-close when within 3% (<code>/guard off</code>)\n` +
       `/card  PnL card friends can copy · /invite  your link and card stats\n` +
       `/markets   /status   /key\n\n` +
-      `<b>How protection works</b>: the bot follows every market you hold through Somnia Reactivity (the chain pushes the mark price on each pool event that changes the mark, measured about once a second) and closes for you when your TP, SL or guard level is reached. It runs while the bot runs; it is not an on-chain stop order.\n\n` +
+      `<b>How protection works</b>: two layers. (1) Chain-held: TP/SL you arm in the dreamDEX app live on chain and fire with no bot at all; /stops shows them and warns when one would close only part of your position or nothing. (2) Bot-side: /tp, /sl and /guard. The bot follows every market you hold through Somnia Reactivity (the chain pushes the mark price on each pool event that changes the mark) and closes for you when a level is reached. That layer runs while the bot runs.\n\n` +
       `Testnet only (${CHAIN_NAME}). Not financial advice.`);
   }
 
@@ -521,19 +533,32 @@ export class Bot {
   }
 
   // ---------- /demo: a live account, no wallet needed ----------
+  /** The demo account first, then earlier demo accounts (their bot orders still count in the history). */
+  private demoAccounts(): string[] {
+    const cur = this.demoAccount.toLowerCase();
+    return [cur, ...this.demoHistory.map((a) => a.toLowerCase()).filter((a) => a !== cur)];
+  }
+
   private async demoData() {
     const account = this.demoAccount;
     const c = this.demoCache;
     if (c && c.account === account && Date.now() - c.at < LIMITS.demoCacheMs) return c;
     const view = await this.venue.account(account);
-    const fresh = { account, at: Date.now(), view, orders: this.store.recentOrders(account, 5), totals: this.store.orderTotals(account) };
+    const accts = this.demoAccounts();
+    const orders = accts.flatMap((a) => this.store.recentOrders(a, 5)).sort((x, y) => (x.t < y.t ? 1 : x.t > y.t ? -1 : 0)).slice(0, 5);
+    const totals = accts.map((a) => this.store.orderTotals(a)).reduce((s, t) => ({
+      orders: s.orders + t.orders, opens: s.opens + t.opens, closes: s.closes + t.closes, autoExits: s.autoExits + t.autoExits, unknown: s.unknown + t.unknown,
+      lastAuto: !s.lastAuto || (t.lastAuto && t.lastAuto.t > s.lastAuto.t) ? t.lastAuto ?? s.lastAuto : s.lastAuto,
+    }));
+    const fresh = { account, at: Date.now(), view, orders, totals };
     this.demoCache = fresh;
     return fresh;
   }
 
   private orderLine(r: OrderRow): string {
     const auto = autoKind(r.reason);
-    const tag = r.kind === "unknown" ? "outcome not confirmed at send" : auto ? `auto: ${auto}` : r.reason ? h(r.reason.slice(0, 40)) : "";
+    const lat = auto && r.latencyMs !== undefined ? `, closed ${(r.latencyMs / 1000).toFixed(1)} s after the ${r.trigSrc === "poll" ? "polled" : "pushed"} mark crossed` : "";
+    const tag = r.kind === "unknown" ? "outcome not confirmed at send" : auto ? `auto: ${auto}${lat}` : r.reason ? h(r.reason.slice(0, 40)) : "";
     const fill = r.filled !== undefined ? ` ${r.filled}${r.avgPrice !== undefined ? ` @ ${fmtPrice(r.avgPrice)}` : ""}` : "";
     return `${r.t.slice(5, 16).replace("T", " ")} ${r.kind} ${r.market} ${r.side}${fill}${tag ? ` · ${tag}` : ""}${r.via === "card" ? " · card copy" : ""} · ${txLink(r.hash)}`;
   }
@@ -546,14 +571,15 @@ export class Bot {
       return `${p.base}-PERP ${p.side} ${p.size} · entry ${fmtPrice(p.entry)} · mark ${fmtPrice(p.mark)} · PnL ${fmtUsd(p.upnl, true)}${dist !== undefined ? ` · ${dist.toFixed(1)}% from liquidation` : ""}`;
     });
     const t = d.totals;
+    const hist = this.demoAccounts().slice(1);
     const w = this.protector.watching();
     await this.say(chat,
-      `<b>Live demo</b>: a dreamDEX account this bot trades for on ${CHAIN_NAME} (paper USDso), through a bot key linked with Link a bot.\n` +
+      `<b>Live demo</b>: a dreamDEX account this bot trades for on ${CHAIN_NAME} (testnet USDso), through a linked bot key.\n` +
       `Account ${addrLink(d.account)} · equity ${fmtUsd(d.view.equity)} USDso\n` +
       (pos.length ? `${pos.join("\n")}\n` : "No open positions right now.\n") +
       (d.orders.length ? `\n<b>Last bot orders</b>\n${d.orders.map((r) => this.orderLine(r)).join("\n")}\n` : "") +
       (t.lastAuto ? `\n<b>Last auto-exit</b>: ${t.lastAuto.t.slice(5, 16).replace("T", " ")} UTC ${t.lastAuto.market} ${autoKind(t.lastAuto.reason)} · ${txLink(t.lastAuto.hash)}\n` : "") +
-      `\n<b>Totals</b>: ${t.orders} orders (${t.opens} opens, ${t.closes} closes), ${t.autoExits} closed by the bot itself (take-profit, stop-loss or guard)${t.unknown ? `, ${t.unknown} not confirmed at send` : ""}.\n` +
+      `\n<b>Totals</b>: ${t.orders} orders (${t.opens} opens, ${t.closes} closes), ${t.autoExits} closed by the bot itself (take-profit, stop-loss or guard)${t.unknown ? `, ${t.unknown} not confirmed at send` : ""}${hist.length ? `; including the earlier demo account${hist.length === 1 ? "" : "s"} ${hist.map((a) => addrLink(getAddress(a))).join(", ")}` : ""}.\n` +
       `<b>Somnia Reactivity</b>: ${w.length} live mark stream${w.length === 1 ? "" : "s"}${w.length ? ` (${w.map((x) => `${x.base} ${x.pushes} pushes`).join(", ")})` : ""}.\n` +
       `${this.linkLine()}.`,
       [[{ text: "Sample PnL card", callback_data: "dc" }], [{ text: "Watch this account", callback_data: "wd" }], [{ text: "Start trading", callback_data: "st" }]]);
@@ -561,8 +587,8 @@ export class Bot {
 
   private async demoCard(viewer: number, chat: number): Promise<void> {
     if (!this.buckets.allow(`card:${viewer}`, LIMITS.cardsPerMinute, 60_000)) { await this.say(chat, "One moment: card limit reached, try again in a minute."); return; }
-    const demo = this.demoAccount.toLowerCase();
-    const du = this.store.all().find((x) => x.owner?.toLowerCase() === demo);
+    const accts = this.demoAccounts();
+    const du = accts.map((a) => this.store.all().find((x) => x.owner?.toLowerCase() === a)).find(Boolean);
     let rec = du ? this.store.cardsBy(du.id)[0] : undefined;
     if (!rec && du?.lastClosed) {
       const c = du.lastClosed;
@@ -700,7 +726,7 @@ export class Bot {
     await this.doClose(u, chat, base, fraction, "manual close");
   }
 
-  private async doClose(u: User, chat: number, base: string, fraction: number, reason: string, opt: { limit?: number; expectSide?: Side; auto?: boolean; owner?: string } = {}): Promise<TradeResult> {
+  private async doClose(u: User, chat: number, base: string, fraction: number, reason: string, opt: { limit?: number; expectSide?: Side; auto?: boolean; owner?: string; trigAt?: number; trigSrc?: "push" | "poll" } = {}): Promise<TradeResult> {
     const tk = this.tk(u);
     if (opt.owner && tk.owner.toLowerCase() !== opt.owner.toLowerCase()) {
       throw new UserError(`Your linked account changed, so the ${base}-PERP exit set on the old account was dropped. Nothing was sent.`);
@@ -741,12 +767,13 @@ export class Bot {
         throw e;
       }
       if (r.filledBase > 0) this.recentClose.set(key, { prevSize: r.prevSize ?? Infinity, at: Date.now(), unknown: false });
-      return this.afterClose(u, chat, base, reason, tk.owner, r);
+      const trig = opt.trigAt !== undefined ? { trigAt: new Date(opt.trigAt).toISOString(), trigSrc: opt.trigSrc } : undefined;
+      return this.afterClose(u, chat, base, reason, tk.owner, r, trig);
     });
   }
 
-  private async afterClose(u: User, chat: number, base: string, reason: string, owner: `0x${string}`, r: TradeResult): Promise<TradeResult> {
-    this.record(u, owner, "close", r, reason);
+  private async afterClose(u: User, chat: number, base: string, reason: string, owner: `0x${string}`, r: TradeResult, extra?: Record<string, string | undefined>): Promise<TradeResult> {
+    this.record(u, owner, "close", r, reason, extra);
     const left = await this.waitPosition(owner, base, (x) => r.filledBase === 0 || !x || x.size < (r.prevSize ?? Infinity) - 1e-12);
     // Relinked while this close was in flight: it was the old account's trade; the new account's records stay as they are.
     const same = u.owner?.toLowerCase() === owner.toLowerCase();
@@ -765,10 +792,10 @@ export class Bot {
     return r;
   }
 
-  private async autoClose(u: User, base: string, fraction: number, reason: string, opt: { kind: "tp" | "sl" | "guard"; limit?: number; side: Side; owner?: string }): Promise<void> {
-    log("auto-close", base, opt.kind, reason);
+  private async autoClose(u: User, base: string, fraction: number, reason: string, opt: { kind: "tp" | "sl" | "guard"; limit?: number; side: Side; owner?: string; at?: number; source?: "push" | "poll" }): Promise<void> {
+    log("auto-close", base, opt.kind, reason, opt.source ?? "");
     try {
-      await this.doClose(u, u.id, base, fraction, reason, { limit: opt.limit, expectSide: opt.side, auto: true, owner: opt.owner });
+      await this.doClose(u, u.id, base, fraction, reason, { limit: opt.limit, expectSide: opt.side, auto: true, owner: opt.owner, trigAt: opt.at, trigSrc: opt.source });
     } catch (e) {
       const msg = e instanceof UserError ? e.message : "chain error";
       log("auto-close failed", base, opt.kind, String(e instanceof Error ? e.message : e).slice(0, 200));
@@ -803,6 +830,14 @@ export class Bot {
     const { owner } = this.requireLinked(u);
     const acct = await this.venue.account(owner);
     if (!acct.positions.length) { await this.say(chat, `No open positions. Equity ${fmtUsd(acct.equity)} USDso. Try <code>/long ETH 20 5x</code>.`); return; }
+    const sr = await this.stopReports(owner, acct).catch(() => undefined);
+    const chainLine = (base: string) => {
+      if (!sr) return "chain-held TP/SL: could not be read right now (/stops)";
+      const r = sr.reports.find((x) => x.base === base);
+      const ls = (r?.lines ?? []).filter((l) => l.kind !== "stop");
+      if (!ls.length) return "chain-held TP/SL: none (only the bot-side exits below)";
+      return `chain-held: ${ls.map((l) => `${l.kind} ${fmtPrice(l.stop.trigger)} ${this.stopIcon(l.level)}`).join(" · ")}${ls.some((l) => l.level === "warn") ? " (see /stops)" : ""}`;
+    };
     const lines = acct.positions.map((p) => {
       const d = liqDistancePct(p.side, p.mark, p.liq);
       const r = u.rules[p.base];
@@ -811,10 +846,139 @@ export class Bot {
         `entry ${fmtPrice(p.entry)} · mark ${fmtPrice(p.mark)}\n` +
         `PnL <b>${fmtUsd(p.upnl, true)}</b> USDso${roe !== undefined ? ` (${roe >= 0 ? "+" : ""}${roe.toFixed(2)}% on margin)` : ""}\n` +
         `liquidation ${p.liq ? `${fmtPrice(p.liq)} (${d!.toFixed(1)}% away)` : p.side === "long" ? "none above 0 (your margin covers this long)" : "n/a"}` +
-        (r ? `\nwatched: ${r.tp ? `TP ${fmtPrice(r.tp)} ` : ""}${r.sl ? `SL ${fmtPrice(r.sl)}` : ""}` : "");
+        `\n${chainLine(p.base)}` +
+        (r ? `\nbot-side: ${r.tp ? `TP ${fmtPrice(r.tp)} ` : ""}${r.sl ? `SL ${fmtPrice(r.sl)}` : ""}` : "");
     });
     const buttons = acct.positions.slice(0, 6).map((p) => [{ text: `Close ${p.base}`, callback_data: closeData(owner, p.base, 100) }, { text: `Card ${p.base}`, callback_data: `cd:${p.base}` }]);
     await this.say(chat, `${lines.join("\n\n")}\n\nEquity ${fmtUsd(acct.equity)} USDso · margin status ${h(acct.status)}`, buttons);
+  }
+
+  // ---------- /stops: dreamDEX's chain-held TP/SL, mirrored and checked ----------
+  /** Native stops and the pool's closing capacity for every market with a position or a pending stop. */
+  private async stopReports(owner: `0x${string}`, view?: AccountView): Promise<{ view: AccountView; reports: PositionReport[]; stops: NativeStop[] }> {
+    const [v, stops] = await Promise.all([view ? Promise.resolve(view) : this.venue.account(owner), this.venue.nativeStops(owner, this.recentRefs(owner))]);
+    const bases = [...new Set([...v.positions.map((p) => p.base), ...stops.map((x) => x.base)])].filter((b) => this.venue.market(b));
+    const reports = await Promise.all(bases.map(async (b) => {
+      const m = this.venue.market(b)!;
+      const pos = v.positions.find((p) => p.base === b);
+      const mine = stops.filter((x) => x.base === b);
+      const cap = mine.length ? await this.venue.reducingCapacity(owner, m).catch(() => undefined) : undefined;
+      const r = checkMarket(b, pos && { base: b, side: pos.side, size: pos.size, mark: pos.mark }, mine, cap, this.venue.minQty(m));
+      if (mine.length && !cap) r.notes.push("The pool's closing capacity could not be read right now, so the resting-order check was skipped");
+      return r;
+    }));
+    return { view: v, reports, stops };
+  }
+
+  private recentRefs(owner: string): { registry: `0x${string}`; orderId: string }[] {
+    const m = this.stopLogs.get(owner.toLowerCase());
+    if (!m) return [];
+    for (const [k, v] of m) if (Date.now() - v.at > 15 * 60_000) m.delete(k);
+    return [...m.values()].map((v) => v.ref);
+  }
+
+  private addRecent(owner: string, refs: { registry: `0x${string}`; orderId: string }[]): void {
+    const key = owner.toLowerCase();
+    let m = this.stopLogs.get(key);
+    if (!m) { if (this.stopLogs.size >= LIMITS.stopCheckUsersMax * 2) this.stopLogs.clear(); this.stopLogs.set(key, (m = new Map())); }
+    for (const ref of refs.slice(0, 50)) if (!m.has(`${ref.registry}_${ref.orderId}`)) m.set(`${ref.registry}_${ref.orderId}`, { ref, at: Date.now() });
+  }
+
+  private stopIcon(level: string): string { return level === "ok" ? "✅" : level === "warn" ? "⚠️" : "ℹ️"; }
+
+  private async cmdStops(id: number, chat: number, arg?: string): Promise<void> {
+    const u = this.store.get(id);
+    let target: `0x${string}` | undefined;
+    if (arg) {
+      if (!isAddress(arg) || BigInt(arg) === 0n) { await this.say(chat, "Send <code>/stops</code> for your linked account or <code>/stops 0xAccount</code> for any dreamDEX account (read only)."); return; }
+      target = getAddress(arg);
+    } else if (u?.owner) target = u.owner;
+    if (!target) { await this.say(chat, "<code>/stops 0xAccount</code> shows the dreamDEX TP/SL the chain holds for an account and checks that each one will close what you expect. Read only. Linked users can send just /stops."); return; }
+    if (!this.buckets.allow(`stops:${id}`, LIMITS.stopsPerMinute, 60_000) || !this.buckets.allow("stops:all", LIMITS.stopsGlobalPerMinute, 60_000)) { await this.say(chat, "One moment: /stops works a few times a minute."); return; }
+    const [{ reports }, lag] = await Promise.all([this.stopReports(target), this.venue.indexerLagS().catch(() => undefined)]);
+    const mine = u?.owner?.toLowerCase() === target.toLowerCase() ? u : undefined;
+    const lagNote = lag !== undefined && lag > 30
+      ? `\nℹ️ The dreamDEX indexer is ${Math.round(lag)} s behind the chain right now, so a stop armed in that window may show up only once it catches up${mine ? " (for your linked account the bot also reads the registries' own logs every minute)" : ""}.`
+      : "";
+    const parts = reports.map((r) => {
+      const head = r.pos ? `<b>${r.base}-PERP ${r.pos.side} ${r.pos.size}</b> · mark ${fmtPrice(r.pos.mark)}` : `<b>${r.base}-PERP</b> (no position)`;
+      const lines = r.lines.map((l) => `${this.stopIcon(l.level)} ${h(l.text)}`);
+      const notes = r.notes.map((n) => `ℹ️ ${h(n)}`);
+      const rule = mine?.rules[r.base];
+      const levels = rule ? [rule.tp ? `TP ${fmtPrice(rule.tp)}` : "", rule.sl ? `SL ${fmtPrice(rule.sl)}` : ""].filter(Boolean).join(" · ") : "";
+      const bot = levels ? [`Bot-side layer: ${levels} (this bot closes the position when the pushed mark crosses)`] : [];
+      return [head, ...lines, ...notes, ...bot].join("\n");
+    });
+    const warns = reports.reduce((n, r) => n + r.lines.filter((l) => l.level === "warn").length, 0);
+    const count = reports.reduce((n, r) => n + r.lines.length, 0);
+    await this.say(chat,
+      `<b>Chain-held stops</b> for ${addrLink(target)}\n` +
+      `dreamDEX TP/SL live in each market's stop registry on chain. The chain checks them and fires them itself, even when no bot is running. This bot reads them and checks that each one will close what you expect.\n\n` +
+      (parts.length ? parts.join("\n\n") : "No open positions and no pending chain-held stops.") +
+      `\n\n${count} chain-held stop${count === 1 ? "" : "s"}, ${warns} warning${warns === 1 ? "" : "s"} · checked ${new Date().toISOString().slice(11, 19)} UTC. Arm or cancel stops in the <a href="${APP_URL}">dreamDEX app</a>.` + lagNote);
+  }
+
+  /** Every minute: warn linked users (once a day per stop and problem) when a chain-held stop will not close what they expect, and tell them when one fired or was dropped. */
+  async stopHealthRound(): Promise<void> {
+    if (this.stopChecking || this.stopping) return;
+    this.stopChecking = true;
+    try {
+      const now = Date.now();
+      const users = this.store.all().filter((x) => x.owner && !x.blockedAt).slice(0, LIMITS.stopCheckUsersMax);
+      for (const u of users) {
+        const owner = u.owner!;
+        const found = await this.venue.recentStopIds(owner).catch(() => undefined);
+        if (found?.length) this.addRecent(owner, found);
+        let r: Awaited<ReturnType<Bot["stopReports"]>>;
+        try { r = await this.stopReports(owner); } catch { continue; }
+        if (u.owner !== owner) continue; // relinked while reading
+        const warned = u.stopWarned ?? {};
+        for (const k of Object.keys(warned)) if (now - warned[k]! > LIMITS.stopWarnRepeatMs) delete warned[k];
+        let changed = false;
+        for (const rep of r.reports) {
+          const fresh = rep.lines.filter((l) => l.level === "warn" && !warned[warnKey(l)]);
+          if (!fresh.length) continue;
+          for (const l of fresh) warned[warnKey(l)] = now;
+          changed = true;
+          // One message per market, however many of its stops have a new problem.
+          await this.say(u.id, `⚠️ <b>Stop health</b> · ${rep.base}-PERP\n${fresh.map((l) => `${h(l.text)}.`).join("\n")}`, [[{ text: "Show my stops", callback_data: "sk" }]]);
+        }
+        const keys = Object.keys(warned);
+        if (keys.length > LIMITS.stopWarnedMax) for (const k of keys.sort((a, b) => warned[a]! - warned[b]!).slice(0, keys.length - LIMITS.stopWarnedMax)) delete warned[k];
+        if (changed || u.stopWarned !== warned) { u.stopWarned = warned; this.store.save(); }
+        // Stops that left PENDING since the last pass: fired, dropped or cancelled.
+        const prev = this.stopSeen.get(u.id);
+        const cur = new Map(r.stops.map((x) => [x.id, { base: x.base, kind: x.isBid ? (x.op === 1 ? "TP" : "SL") : (x.op === 0 ? "TP" : "SL"), trigger: x.trigger }]));
+        this.stopSeen.set(u.id, cur);
+        if (!prev) continue;
+        const gone = [...prev].filter(([id]) => !cur.has(id));
+        if (gone.length) await this.stopsEnded(u, owner, gone).catch((e) => log("stop end lookup failed", String(e).slice(0, 120)));
+      }
+    } finally { this.stopChecking = false; }
+  }
+
+  private static DROP_TEXT: Record<string, string> = {
+    ReduceOnlyNoPosition: "there was no position left to close",
+    ReduceOnlyWrongSide: "the position was on the other side by then",
+    ReduceOnlyBelowMinQty: "what it could close was below the minimum order size (resting orders on the closing side can use up the position's closing capacity)",
+    PlacementFailed: "the market rejected its order",
+    NoFill: "its order found nothing to fill against",
+  };
+
+  private async stopsEnded(u: User, owner: `0x${string}`, gone: [string, { base: string; kind: string; trigger: number }][]): Promise<void> {
+    const rows = await this.venue.exchange.client.listPerpStopOrders({ account: owner.toLowerCase(), status: ["TRIGGERED", "TRIGGER_FAILED", "CANCELLED"], limit: 30 });
+    for (const [id, info] of gone.slice(0, 5)) {
+      const r = rows.find((x) => `${String(x.registry).toLowerCase()}_${x.orderIdRaw}` === id);
+      const what = `chain-held ${info.kind} ${fmtPrice(info.trigger)} on ${info.base}-PERP`;
+      if (!r) continue; // not indexed yet, or cancelled by the owner long ago: nothing to say
+      if (r.status === "TRIGGERED") await this.say(u.id, `✅ Your ${what} fired: the chain placed its closing order by itself. /positions shows what is left.`);
+      else if (r.status === "TRIGGER_FAILED") {
+        const why = Bot.DROP_TEXT[String(r.dropReason)] ?? "it was dropped";
+        await this.say(u.id, `⚠️ Your ${what} fired but placed nothing: ${why}. Its fee is spent. Check /stops.`);
+      } else if (r.status === "CANCELLED" && r.cancelReason === "LinkedFill") {
+        await this.say(u.id, `Your ${what} was cancelled because its linked partner filled. If that fill was only partial, the rest of the position has no chain-held stop now: /stops.`);
+      }
+    }
   }
 
   private async cmdRule(u: User, chat: number, kind: "tp" | "sl", args: string[]): Promise<void> {
@@ -1126,6 +1290,7 @@ export class Bot {
       if (data === "dc") { await this.demoCard(q.from.id, chat); return; }
       if (data === "st") { await this.cmdStart(q.from.id, chat); return; }
       if (data === "wd") { const r = await this.ensureUser(q.from.id, chat, { key: false }); if (r) await this.cmdWatch(r.user, chat, this.demoAccount); return; }
+      if (data === "sk") { await this.cmdStops(q.from.id, chat); return; }
       const wu = this.store.get(q.from.id);
       if (!wu) { await this.say(chat, "Send /start first."); return; }
       // Watch buttons work for watch-only records (no key).

@@ -62,6 +62,7 @@ test("T12 (positive control): switching the demo account shows that account's ro
   const h = makeBot();
   fixture(h);
   h.bot.demoAccount = OTHER;
+  h.bot.demoHistory = [];
   await h.handle(msg(502, "/demo"));
   const out = h.to(502).at(-1)!.html;
   assert.ok(out.includes(hx(6)));
@@ -82,4 +83,39 @@ test("/demo buttons: Sample PnL card (from the demo user's lastClosed) and Start
   await h.handle(cb(601, "st"));
   assert.ok(h.bot.store.get(601));
   assert.match(h.to(601).at(-1)!.html, /^Look around first, no wallet needed: \/demo/);
+});
+
+test("/demo history: the current demo account's rows merge with the earlier demo account's (newest first), totals add up", async () => {
+  const h = makeBot();
+  fixture(h);                                   // 7 valid rows on the earlier account (DEMO, 10-20)
+  const CUR = "0x2A11e7388D1D2F9690f2636846d44b478f61bF08";
+  appendFileSync(`${h.bot.store["dir"]}/orders.jsonl`, [
+    JSON.stringify({ t: "2026-10-29T01:10:00.000Z", kind: "open", market: "XRP-PERP", side: "long", hash: hx(101), filled: 8, requested: 8, avgPrice: 1.3, key: "0x00000000000000000000000000000000000000bb", account: CUR.toLowerCase() }),
+    JSON.stringify({ t: "2026-10-29T01:11:00.000Z", kind: "close", reason: "take-profit 1.31 reached (mark 1.31)", market: "XRP-PERP", side: "short", hash: hx(102), filled: 8, requested: 8, avgPrice: 1.31, key: "0x00000000000000000000000000000000000000bb", account: CUR.toLowerCase() }),
+  ].join("\n") + "\n");
+  h.bot.demoAccount = CUR;
+  h.bot.demoHistory = [DEMO];
+  await h.handle(msg(503, "/demo"));
+  const out = h.to(503).at(-1)!.html;
+  const lines = orderLines(out);
+  assert.equal(lines.length, 5);
+  assert.ok(lines[0]!.includes(`…${hx(102).slice(-6)}<`) && lines[1]!.includes(`…${hx(101).slice(-6)}<`), "the new account's rows come first");
+  assert.match(out, /Totals<\/b>: 9 orders \(4 opens, 5 closes\), 3 closed by the bot itself/);
+  assert.match(out, /including the earlier demo account <a href="[^"]+0x0e7E8DF6Eac2E14165b4fA4CB2BD4e445d0E3817">/);
+  assert.match(out, /Last auto-exit<\/b>: 10-29 01:11 UTC XRP-PERP take-profit/);
+});
+
+test("/demo shows trigger-to-close time for auto exits that carry a trigger stamp; bad stamps are ignored", async () => {
+  const h = makeBot();
+  appendFileSync(`${h.bot.store["dir"]}/orders.jsonl`, [
+    row(1, { kind: "close", reason: "stop-loss 107.03 reached (mark 107.02)", t: "2026-10-29T01:00:03.400Z", trigAt: "2026-10-29T01:00:00.000Z", trigSrc: "push" }),
+    row(3, { kind: "close", reason: "take-profit 104.30 reached (mark 104.31)", t: "2026-10-29T01:01:00.000Z", trigAt: "2026-10-29T01:05:00.000Z" }), // after the row: ignored
+    row(5, { kind: "close", reason: "take-profit 104.30 reached (mark 104.31)", t: "2026-10-29T01:02:00.000Z", trigAt: "<script>" }),
+  ].join("\n") + "\n");
+  h.bot.demoAccount = DEMO; h.bot.demoHistory = [];
+  await h.handle(msg(504, "/demo"));
+  const lines = orderLines(h.to(504).at(-1)!.html);
+  assert.equal(lines.length, 3);
+  assert.match(lines.find((l) => l.includes(`…${hx(1).slice(-6)}<`))!, /auto: stop-loss, closed 3\.4 s after the pushed mark crossed/);
+  for (const n of [3, 5]) assert.doesNotMatch(lines.find((l) => l.includes(`…${hx(n).slice(-6)}<`))!, /closed .* s after/);
 });

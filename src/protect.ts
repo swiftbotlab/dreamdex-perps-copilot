@@ -20,7 +20,7 @@ const SUB_FAIL_RESET = 3; // subscribe failures in a row before the push socket 
 /** A linked user's position as last read. `owner` (lowercase) is the account it was read from. */
 export interface Held { userId: number; owner: string; base: string; pool: `0x${string}`; side: Side; size: number; entry: number; liq?: number }
 /** `opt.owner`: the account the trigger was computed for; the close must go to that account or not at all. */
-export type Act = (u: User, base: string, fraction: number, reason: string, opt: { kind: "tp" | "sl" | "guard"; limit?: number; side: Side; owner?: string }) => Promise<void>;
+export type Act = (u: User, base: string, fraction: number, reason: string, opt: { kind: "tp" | "sl" | "guard"; limit?: number; side: Side; owner?: string; at?: number; source?: "push" | "poll" }) => Promise<void>;
 export type Warn = (u: User, base: string, text: string) => Promise<void>;
 /** A position of a watched account (addr lowercase). */
 export interface WHeld { addr: string; base: string; pool: `0x${string}`; side: Side; size: number; entry: number; liq?: number; mark?: number }
@@ -306,7 +306,7 @@ export class Protector {
       if (!reason && dist !== undefined && u.guardPct && dist <= u.guardPct) { reason = `liquidation guard: mark ${fmtPrice(mark)} is ${dist.toFixed(2)}% from liquidation ${fmtPrice(h.liq!)}`; opt = { kind: "guard", side: h.side }; }
       if (reason) {
         this.inflight.add(key); this.stats.triggers++;
-        const run = this.act(u, h.base, 1, reason, { ...opt, owner: h.owner });
+        const run = this.act(u, h.base, 1, reason, { ...opt, owner: h.owner, at: Date.now(), source: _source });
         this.running.add(run);
         try { await run; } catch { this.coolUntil.set(key, Date.now() + (opt.kind === "tp" ? 4_000 : 30_000)); } finally {
           this.running.delete(run);

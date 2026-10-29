@@ -2,7 +2,7 @@
 // Every write is `placeOrderFor(owner, ...)` from the user's linked key: the order, margin and fills
 // belong to the user's dreamDEX account; the key only pays gas and cannot move funds.
 import { ORDER_TYPE, SOMNIA_TESTNET_ADDRESSES, SomniaMarkets } from "@somnia-chain/markets-sdk";
-import { createPublicClient, defineChain, formatUnits, http, parseAbi, type PublicClient } from "viem";
+import { createPublicClient, defineChain, formatUnits, http, parseAbi, toEventSelector, type PublicClient } from "viem";
 import { socketClientCache } from "viem/utils";
 import { CHAIN_ID, DEMO_ACCOUNT, INDEXER_URL, LIMITS, RPC_URL, WS_URL } from "./config.ts";
 import { alignPrice, alignQuantity, perpMarkets, toRaw, type PerpMarket } from "./vendor/perp-core/markets.ts";
@@ -10,6 +10,7 @@ import { createTradingKey, linkStatus, placeFor, SendError, type TradingKey } fr
 import { KeyedLock } from "./locks.ts";
 import { sizeOrder } from "./vendor/perp-core/orders.ts";
 import type { Side } from "./parse.ts";
+import type { Capacity, NativeStop } from "./stops.ts";
 
 export const chain = defineChain({
   id: CHAIN_ID,
@@ -19,6 +20,10 @@ export const chain = defineChain({
 });
 
 const POOL_ABI = parseAbi(["function tryGetMarkPrice() view returns (bool ok, uint256 price)"]);
+const CAP_ABI = parseAbi(["function getReducingCapacity(address account) view returns ((int128 positionSize, uint256 pendingBidQuantity, uint256 pendingAskQuantity, uint256 pendingOppositeQuantity, uint256 effectiveReducingCapacity) capacity)"]);
+const DEC = /^\d{1,78}$/;
+// PerpStopOrderRegistry: PendingOrderCreated(uint128 indexed orderId, address indexed owner, bool, uint256, uint256, uint8, uint8, address, uint96)
+const STOP_CREATED_TOPIC = toEventSelector("PendingOrderCreated(uint128,address,bool,uint256,uint256,uint8,uint8,address,uint96)");
 
 export interface Position {
   base: string; pool: `0x${string}`; side: Side; size: number; entry: number; mark: number;
@@ -47,6 +52,7 @@ export class Venue {
   exchange!: SomniaMarkets;
   private markets = new Map<string, PerpMarket>();
   private byPool = new Map<string, PerpMarket>();
+  private byRegistry = new Map<string, PerpMarket>();
   private loadedAt = 0;
   private keys = new Map<number, TradingKey>();
   /** One send at a time per trading key (innermost lock), so two orders never pick the same nonce. */
@@ -91,7 +97,7 @@ export class Venue {
     if (!force && Date.now() - this.loadedAt < 10 * 60_000) return;
     const list = await perpMarkets(this.exchange, true);
     if (!list.length) throw new Error("no perp markets found");
-    const m = new Map<string, PerpMarket>(), p = new Map<string, PerpMarket>();
+    const m = new Map<string, PerpMarket>(), p = new Map<string, PerpMarket>(), r = new Map<string, PerpMarket>();
     const hex40 = /^0x[0-9a-fA-F]{40}$/;
     for (const x of list) {
       // Indexer data is untrusted too: only well-formed symbols and addresses become markets.
@@ -99,8 +105,9 @@ export class Venue {
       if (BigInt(x.info.marginBank) === 0n) continue;
       m.set(x.display.replace(/-PERP$/, ""), x);
       p.set(x.info.poolAddress.toLowerCase(), x);
+      if (hex40.test(x.info.stopRegistry ?? "") && BigInt(x.info.stopRegistry) !== 0n) r.set(x.info.stopRegistry.toLowerCase(), x);
     }
-    this.markets = m; this.byPool = p; this.loadedAt = Date.now();
+    this.markets = m; this.byPool = p; this.byRegistry = r; this.loadedAt = Date.now();
   }
 
   list(): PerpMarket[] { return [...this.markets.values()]; }
@@ -156,6 +163,100 @@ export class Venue {
     }
     return { equity: q(a.equity), unlocked: q(a.unlockedCollateralBalance), locked: q(a.lockedCollateral), mmReq: q(a.mmReq), imReq: q(a.imReq), status: String(a.marginStatus), positions };
   }
+
+  /**
+   * The account's PENDING native perp stops (dreamDEX TP/SL held by each market's PerpStopOrderRegistry). The
+   * registry has no enumeration getter, so ids come from two places: the indexer (all of them, but it can lag the
+   * chain by minutes) and `extra`, ids the caller found in the registries' own PendingOrderCreated logs (what the
+   * indexer has not reached yet; see recentStopIds). Every id is then read from its registry in one chain batch,
+   * which is the truth for size, trigger and link. Indexer rows are untrusted: only rows of a known market's own
+   * registry and of this owner, with well-formed numbers, are kept.
+   */
+  async nativeStops(owner: `0x${string}`, recent: readonly { registry: `0x${string}`; orderId: string }[] = []): Promise<NativeStop[]> {
+    const c = this.exchange.client;
+    const lower = owner.toLowerCase();
+    const rows = await c.listPerpStopOrders({ account: lower, status: ["PENDING"], limit: 50 });
+    const keep = new Map<string, { m: PerpMarket; ref: { registry: `0x${string}`; orderId: string }; s?: NativeStop }>();
+    for (const r of rows.slice(0, 50)) {
+      const m = this.marketByPool(String(r.market?.poolAddress ?? ""));
+      if (!m || String(r.registry).toLowerCase() !== m.info.stopRegistry.toLowerCase() || String(r.owner).toLowerCase() !== lower) continue;
+      if (!/^\d{1,39}$/.test(r.orderIdRaw) || !DEC.test(r.quantity) || !DEC.test(r.triggerPrice) || (r.triggerOperator !== 0 && r.triggerOperator !== 1)) continue;
+      const registry = m.info.stopRegistry;
+      const id = `${registry.toLowerCase()}_${r.orderIdRaw}`;
+      keep.set(id, {
+        m, ref: { registry, orderId: r.orderIdRaw },
+        s: {
+          id, registry, orderId: r.orderIdRaw, base: this.baseOf(m), isBid: !!r.isBid,
+          qty: Number(formatUnits(BigInt(r.quantity), m.info.baseDecimals)), trigger: Number(formatUnits(BigInt(r.triggerPrice), 18)),
+          op: r.triggerOperator as 0 | 1, market: r.orderType === 1, linked: r.siblingOrderId != null, reduceOnly: r.intent !== "opening", onChain: false,
+        },
+      });
+    }
+    for (const ref of recent) {
+      const m = this.byRegistry.get(ref.registry.toLowerCase());
+      const id = `${ref.registry.toLowerCase()}_${ref.orderId}`;
+      if (m && !keep.has(id) && keep.size < 60) keep.set(id, { m, ref: { registry: m.info.stopRegistry, orderId: ref.orderId } });
+    }
+    if (!keep.size) return [];
+    const list = [...keep.entries()];
+    const reads = await c.getPerpStopOrders(list.map(([, k]) => k.ref) as never).catch(() => undefined);
+    const out: NativeStop[] = [];
+    list.forEach(([id, k], i) => {
+      const rd = reads?.[i] as { status: string; order?: Record<string, unknown> } | undefined;
+      if (rd?.status === "absent") return; // fired or cancelled since it was listed
+      const o = rd?.status === "present" ? rd.order : undefined;
+      if (o && String(o.owner).toLowerCase() === lower && typeof o.quantity === "bigint" && typeof o.triggerPrice === "bigint" && (o.triggerOperator === 0 || o.triggerOperator === 1)) {
+        out.push({
+          id, registry: k.m.info.stopRegistry, orderId: k.ref.orderId, base: this.baseOf(k.m),
+          isBid: o.isBid === true, qty: Number(formatUnits(o.quantity, k.m.info.baseDecimals)), trigger: Number(formatUnits(o.triggerPrice, 18)),
+          op: o.triggerOperator as 0 | 1, market: o.orderType === 1, linked: typeof o.siblingOrderId === "bigint" ? o.siblingOrderId !== 0n : !!k.s?.linked,
+          reduceOnly: o.intent !== "opening", onChain: true,
+        });
+      } else if (k.s) out.push(k.s); // the chain read failed for this one: keep the indexer row, labelled as unconfirmed
+    });
+    return out;
+  }
+
+  /**
+   * Stop ids this owner created in the last 1,000 blocks (about 100 s), from the registries' own logs. One
+   * getLogs (the public RPC serves at most 1,000 blocks per call and takes 2-8 s), so only background passes call it.
+   */
+  async recentStopIds(owner: `0x${string}`): Promise<{ registry: `0x${string}`; orderId: string }[]> {
+    const regs = [...this.byRegistry.keys()] as `0x${string}`[];
+    if (!regs.length) return [];
+    const head = await this.pub.getBlockNumber();
+    const ownerTopic = `0x${owner.slice(2).toLowerCase().padStart(64, "0")}` as `0x${string}`;
+    const logs = (await this.pub.request({
+      method: "eth_getLogs",
+      params: [{ address: regs, topics: [STOP_CREATED_TOPIC, null, ownerTopic], fromBlock: `0x${(head - 999n).toString(16)}`, toBlock: `0x${head.toString(16)}` }],
+    } as never)) as { address: string; topics: `0x${string}`[] }[];
+    const out: { registry: `0x${string}`; orderId: string }[] = [];
+    for (const l of logs.slice(0, 50)) {
+      if (!l.topics[1] || !/^0x[0-9a-f]{40}$/i.test(l.address) || !this.byRegistry.has(l.address.toLowerCase())) continue;
+      out.push({ registry: l.address.toLowerCase() as `0x${string}`, orderId: BigInt(l.topics[1]).toString() });
+    }
+    return out;
+  }
+
+  /** How far the dreamDEX indexer is behind the chain, in seconds (cached 30 s); undefined when unknown. */
+  private lagCache?: { at: number; v?: number };
+  async indexerLagS(): Promise<number | undefined> {
+    if (this.lagCache && Date.now() - this.lagCache.at < 30_000) return this.lagCache.v;
+    const f = await this.exchange.client.getIndexerFreshness(CHAIN_ID).catch(() => undefined) as { lagSeconds?: unknown } | undefined;
+    const n = Number(f?.lagSeconds);
+    const v = Number.isFinite(n) && n >= 0 && n < 86_400 ? n : undefined;
+    this.lagCache = { at: Date.now(), v };
+    return v;
+  }
+
+  /** PerpPool.getReducingCapacity: the position minus the owner's resting orders on the closing side. */
+  async reducingCapacity(owner: `0x${string}`, m: PerpMarket): Promise<Capacity> {
+    const r = await this.pub.readContract({ address: m.info.poolAddress, abi: CAP_ABI, functionName: "getReducingCapacity", args: [owner] });
+    const q = (v: bigint) => Number(formatUnits(v, m.info.baseDecimals));
+    return { position: q(r.positionSize), pendingBid: q(r.pendingBidQuantity), pendingAsk: q(r.pendingAskQuantity), effective: q(r.effectiveReducingCapacity) };
+  }
+
+  minQty(m: PerpMarket): number { return Number(formatUnits(BigInt(m.info.minQuantity), m.info.baseDecimals)); }
 
   async accountCap(owner: `0x${string}`, m: PerpMarket): Promise<number> {
     return this.exchange.client.getPerpMaxLeverage({ marginBank: m.info.marginBank, account: owner, pool: m.info.poolAddress });

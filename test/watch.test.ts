@@ -103,7 +103,7 @@ test("T10: the Guard it button is hidden for your own linked account; /watch lis
 test("/demo's Watch this account button works before /start", async () => {
   const h = makeBot();
   await h.handle(cb(9, "wd"));
-  assert.deepEqual(h.bot.store.get(9).watches.map((w: { addr: string }) => w.addr), ["0x0e7E8DF6Eac2E14165b4fA4CB2BD4e445d0E3817"]);
+  assert.deepEqual(h.bot.store.get(9).watches.map((w: { addr: string }) => w.addr), ["0x2A11e7388D1D2F9690f2636846d44b478f61bF08"]); // the current demo account
 });
 
 test("watch-only users are kept by the 48 h unlinked-user prune; plain unlinked users are not", async () => {
