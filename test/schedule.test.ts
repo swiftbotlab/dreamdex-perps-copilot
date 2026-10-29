@@ -12,7 +12,7 @@ const jobs = () => { try { return JSON.parse(readFileSync(`${PATHS.data}/sandbox
 
 export function setup() {
   const h = makeBot();
-  const u = h.addUser(8684117854, DEMO);
+  const u = h.addUser(5550001, DEMO);
   const closes: string[] = [];
   h.bot.venue.close = async (tk: { owner: string }, base: string) => {
     const list = h.state.positions.get(tk.owner.toLowerCase()) ?? [];
@@ -114,6 +114,55 @@ test("SC5: a user's own /tp on that market is reported (un-quiet)", async () => 
   const { h, u } = setup();
   await h.bot.demoScheduleTick(at("2026-10-29T03:25:00Z"));
   const base = h.state.opens[0]!.base;
-  await h.handle(msg(8684117854, `/sl ${base} 2%`));
+  await h.handle(msg(5550001, `/sl ${base} 2%`));
   assert.equal(u.rules[base].quiet, undefined);
+});
+
+test("SC6 (re-review): a fresh fill not yet visible is not taken for an exit; a partial close keeps the rest; a size mismatch is never closed; 5 failures alert", async () => {
+  const { h, u, closes } = setup();
+  await h.bot.demoScheduleTick(at("2026-10-29T03:25:00Z"));
+  const base = h.state.opens[0]!.base;
+  const pos = h.state.positions.get(DEMO.toLowerCase())!;
+  // the read lags the fill: no position seen, within 90 s of the fill -> the job stays
+  h.state.positions.set(DEMO.toLowerCase(), []);
+  await h.bot.sandboxSweep();
+  assert.equal(jobs().length, 1, "kept: the fill may not be readable yet");
+  h.state.positions.set(DEMO.toLowerCase(), pos);
+  // partial close: the IOC fills half
+  const full = pos[0]!.size;
+  h.bot.venue.close = async (tk: { owner: string }, b: string, _f: number, _l: unknown, guard?: (a: number, s: string) => void) => {
+    const p = h.state.positions.get(tk.owner.toLowerCase())!.find((x) => x.base === b)!;
+    guard?.(p.size, p.side);
+    const half = p.size / 2; p.size -= half; closes.push(b);
+    return { hash: `0x${"cd".repeat(32)}`, filledBase: half, avgPrice: 100, requestedBase: half * 2, base: b, side: "short", realizedPnl: 0, entry: p.entry, prevSize: half * 2 };
+  };
+  await h.bot.sandboxSweep(Date.now() + 46 * 60_000);
+  assert.equal(jobs().length, 1);
+  assert.ok(Math.abs(jobs()[0].size - full / 2) < 1e-9, "the job now covers the rest");
+  // someone else changes the size meanwhile -> the job's position is gone: dropped, not closed
+  pos[0]!.size = full; const n = closes.length;
+  await h.bot.sandboxSweep(Date.now() + 47 * 60_000);
+  assert.equal(closes.length, n, "a position of another size is never closed");
+  assert.equal(jobs().length, 0);
+  // five failed closes -> one alert in the owner's chat
+  h.state.positions.clear();
+  assert.match(await h.bot.demoScheduleTick(at("2026-10-29T11:25:00Z")), /^opened/);
+  h.bot.venue.close = async () => { throw new Error("rpc down"); };
+  for (let i = 0; i < 6; i++) await h.bot.sandboxSweep(Date.now() + 46 * 60_000);
+  assert.equal(h.to(u.id).filter((m) => /has failed 5 times/.test(m.html)).length, 1);
+  assert.equal(base.length > 0, true);
+});
+
+test("SC7 (re-review): the owner's own open on a market with a sandbox job is refused; the sweep skips a job whose send is running", async () => {
+  const { h, u } = setup();
+  await h.bot.demoScheduleTick(at("2026-10-29T03:25:00Z"));
+  const base = h.state.opens[0]!.base;
+  await h.handle(msg(5550001, `/long ${base} 10 5x`));
+  assert.match(h.to(u.id).at(-1)!.html, /runs a scheduled trade or a trial/);
+  assert.equal(h.state.opens.length, 1);
+  const j = jobs()[0];
+  h.bot.sendingJobs.add(j.id);
+  h.state.positions.set(DEMO.toLowerCase(), []);
+  await h.bot.sandboxSweep(Date.now() + 10 * 60_000);
+  assert.equal(jobs().length, 1, "skipped while its send runs");
 });

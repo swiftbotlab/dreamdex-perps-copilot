@@ -13,6 +13,7 @@ export interface SandboxJob {
   at: number;                 // when the job was created (just before the send)
   deadline: number;           // close it after this time if it is still open
   hash?: string; size?: number; entry?: number; // the fill, once known (provisional until then)
+  filledAt?: number;          // when the send returned (fill known, or outcome unknown)
   chat?: number;              // the trier's chat, for "try" (private file, never logged or published)
   attempts?: number;          // failed closes so far
 }

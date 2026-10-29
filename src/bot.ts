@@ -92,6 +92,8 @@ export class Bot {
   private tryCaps = new TryCaps(`${PATHS.data}/try.json`);
   private jobs = new SandboxJobs(`${PATHS.data}/sandbox_jobs.json`);
   private sweepingSandbox = false;
+  /** Sandbox jobs whose open is still being sent: the sweep never judges them by a read taken mid-send. */
+  private sendingJobs = new Set<string>();
   /** Background work that sends orders (schedule ticks, sandbox sweeps): shutdown waits for it. */
   private bg = new Set<Promise<unknown>>();
   /** Stop ids found in the registries' own logs (newer than the indexer), per owner (lowercase), kept 15 minutes. */
@@ -685,6 +687,9 @@ export class Bot {
   private async openLocked(u: User, chat: number, side: Side, p: OpenCmd, tk: ReturnType<Bot["tk"]>, opts: { maxTouchPct?: number; via?: "card" | "schedule" | "try"; card?: string; quiet?: boolean } = {}): Promise<TradeResult | undefined> {
     this.notStopping();
     const m = this.venue.market(p.base)!;
+    if (opts.via !== "schedule" && opts.via !== "try" && tk.owner.toLowerCase() === this.demoAccount.toLowerCase() && this.jobs.all().some((j) => j.base === p.base)) {
+      throw new UserError(`The demo account runs a scheduled trade or a trial on ${p.base}-PERP right now. Pick another market or try again in a few minutes.`);
+    }
     await this.checkUnresolved(tk, p.base);
     const [cap, acct] = await Promise.all([this.venue.accountCap(tk.owner, m), this.venue.account(tk.owner)]);
     if (cap > 0 && p.leverage > cap) throw new UserError(`Your account caps ${p.base}-PERP at ${cap}x (set in the app). Use ${cap}x or less, or raise it in the app.`);
@@ -751,7 +756,7 @@ export class Bot {
     await this.doClose(u, chat, base, fraction, "manual close");
   }
 
-  private async doClose(u: User, chat: number, base: string, fraction: number, reason: string, opt: { limit?: number; expectSide?: Side; auto?: boolean; owner?: string; trigAt?: number; trigSrc?: "push" | "poll" } = {}): Promise<TradeResult> {
+  private async doClose(u: User, chat: number, base: string, fraction: number, reason: string, opt: { limit?: number; expectSide?: Side; expectSize?: number; auto?: boolean; owner?: string; trigAt?: number; trigSrc?: "push" | "poll" } = {}): Promise<TradeResult> {
     const tk = this.tk(u);
     if (opt.owner && tk.owner.toLowerCase() !== opt.owner.toLowerCase()) {
       throw new UserError(`Your linked account changed, so the ${base}-PERP exit set on the old account was dropped. Nothing was sent.`);
@@ -766,6 +771,9 @@ export class Bot {
       // Runs inside venue.close right after the fresh position read, before anything is sent.
       const guard = (abs: number, side: Side) => {
         read = { abs, side };
+        if (opt.expectSize !== undefined && Math.abs(abs - opt.expectSize) > Math.max(1e-12, opt.expectSize * 1e-6)) {
+          throw new UserError(`The ${base}-PERP position is ${abs}, not the ${opt.expectSize} this close was meant for. Nothing was sent.`);
+        }
         if (opt.expectSide && side !== opt.expectSide) {
           sideChanged = true;
           throw new UserError(`Your ${base}-PERP position is now a ${side}, not the ${opt.expectSide} this exit was set for. Nothing was sent, and the old ${base} exits were cleared.`);
@@ -906,49 +914,72 @@ export class Bot {
       if (refused) return { refused };
       const id = randomBytes(6).toString("hex");
       const at = Date.now();
-      this.jobs.add({ id, kind, base, side, at, deadline: at + o.holdMs, chat: o.chat, attempts: 0 });
-      const p: OpenCmd = { kind: "open", side, base, margin: o.margin, leverage: o.leverage, tp: { pct: o.tpPct }, sl: { pct: o.slPct } };
-      let r: TradeResult | undefined;
+      this.sendingJobs.add(id);
       try {
-        r = await this.openLocked(u, 0, side, p, tk, { via: kind, quiet: true, maxTouchPct: SANDBOX_TOUCH_PCT });
-      } catch (e) {
-        if (e instanceof OutcomeUnknown) this.jobs.update(id, { deadline: Date.now() + 2 * 60_000 }); // may have filled: close it soon
-        else this.jobs.remove(id); // nothing was sent
-        throw e;
-      }
-      if (!r || r.filledBase === 0) { this.jobs.remove(id); return { r }; }
-      const rule = u.rules[base];
-      const covered = !!rule?.tp && !!rule?.sl && rule.side === side;
-      this.jobs.update(id, { hash: r.hash, size: r.filledBase, entry: r.avgPrice, deadline: covered ? at + o.holdMs : Date.now() });
-      if (!covered) log("sandbox: TP/SL not set for", base, "closing at the next sweep");
-      return { r };
+        this.jobs.add({ id, kind, base, side, at, deadline: at + o.holdMs, chat: o.chat, attempts: 0 });
+        const p: OpenCmd = { kind: "open", side, base, margin: o.margin, leverage: o.leverage, tp: { pct: o.tpPct }, sl: { pct: o.slPct } };
+        let r: TradeResult | undefined;
+        try {
+          r = await this.openLocked(u, 0, side, p, tk, { via: kind, quiet: true, maxTouchPct: SANDBOX_TOUCH_PCT });
+        } catch (e) {
+          if (e instanceof OutcomeUnknown) this.jobs.update(id, { deadline: Date.now() + 2 * 60_000, filledAt: Date.now() }); // may have filled: close it soon
+          else this.jobs.remove(id); // nothing was sent
+          throw e;
+        }
+        if (!r || r.filledBase === 0) { this.jobs.remove(id); return { r }; }
+        const rule = u.rules[base];
+        const covered = !!rule?.tp && !!rule?.sl && rule.side === side;
+        this.jobs.update(id, { hash: r.hash, size: r.filledBase, entry: r.avgPrice, filledAt: Date.now(), deadline: covered ? at + o.holdMs : Date.now() });
+        if (!covered) log("sandbox: TP/SL not set for", base, "closing at the next sweep");
+        return { r };
+      } finally { this.sendingJobs.delete(id); }
     });
   }
 
-  /** Every minute and at start: close overdue sandbox jobs (retrying failures), drop finished ones, report trials. */
+  /**
+   * Every minute and at start: close overdue sandbox jobs (retrying failures), drop finished ones, report trials.
+   * A job whose open is still being sent is skipped; "no position" ends a job only 90 s after its fill (reads can
+   * lag a fresh fill) and only when no unconfirmed order is pending on that market.
+   */
   async sandboxSweep(now = Date.now()): Promise<void> {
     if (this.stopping || this.sweepingSandbox) return;
     this.sweepingSandbox = true;
     try {
       let jobs;
       try { jobs = this.jobs.all(); } catch (e) { log("sandbox jobs unreadable:", String(e).slice(0, 120)); return; }
+      jobs = jobs.filter((j) => !this.sendingJobs.has(j.id));
       if (!jobs.length) return;
       const u = this.demoUser();
-      if (!u) return;
+      if (!u) { log("sandbox: no linked demo user; jobs kept:", jobs.length); return; }
       const acct = await this.venue.account(u.owner!);
       for (const job of jobs) {
         const pos = acct.positions.find((x) => x.base === job.base);
-        if (!pos || pos.side !== job.side) { await this.sandboxDone(job, "closed"); continue; }
+        if (!pos || pos.side !== job.side) {
+          const settled = now - (job.filledAt ?? job.at) > 90_000 && !this.unresolved.has(`${u.owner!.toLowerCase()}:${job.base}`);
+          if (settled) await this.sandboxDone(job, "closed");
+          continue;
+        }
         if (!isJobPosition(job, pos)) { log("sandbox: the", job.base, "position changed; leaving it alone"); await this.sandboxDone(job, "changed"); continue; }
         if (now < job.deadline) continue;
         try {
           const hold = Math.round((job.kind === "try" ? TRY.maxHoldMs : DEMO_SCHEDULE.maxHoldMs) / 60_000);
-          await this.doClose(u, 0, job.base, 1, job.kind === "try" ? `trial closed after ${hold} min` : `scheduled flatten after ${hold} min`, { expectSide: job.side, auto: true, owner: this.demoAccount });
+          const r = await this.doClose(u, 0, job.base, 1, job.kind === "try" ? `trial closed after ${hold} min` : `scheduled flatten after ${hold} min`,
+            { expectSide: job.side, expectSize: job.size, auto: true, owner: this.demoAccount });
+          const left = (r.prevSize ?? pos.size) - r.filledBase;
+          if (left > Math.max(1e-12, pos.size * 1e-6)) {
+            // An IOC close can fill only part: keep the job for the rest (same entry), still overdue.
+            this.jobs.update(job.id, { size: left, attempts: (job.attempts ?? 0) + 1 });
+            log("sandbox: partial close, rest kept:", job.base, left);
+            continue;
+          }
           log("sandbox: closed", job.kind, job.base);
           await this.sandboxDone(job, "closed");
         } catch (e) {
-          this.jobs.update(job.id, { attempts: (job.attempts ?? 0) + 1 });
-          log("sandbox: close failed, retrying next minute:", job.base, String(e instanceof Error ? e.message : e).slice(0, 160));
+          const attempts = (job.attempts ?? 0) + 1;
+          this.jobs.update(job.id, { attempts });
+          const msg = String(e instanceof Error ? e.message : e).slice(0, 160);
+          log("sandbox: close failed, retrying next minute:", job.base, msg);
+          if (attempts === 5) await this.say(u.id, `⚠️ Sandbox: closing the ${job.kind === "try" ? "trial" : "scheduled"} ${job.base}-PERP position on the demo account has failed ${attempts} times (${h(msg)}). I keep retrying every minute; check /positions.`);
         }
       }
     } finally { this.sweepingSandbox = false; }
@@ -1009,7 +1040,8 @@ export class Bot {
     const jobs = this.jobs.all();
     if (jobs.some((j) => j.kind === "schedule")) return "The sandbox is running its scheduled trade. Try again in a few minutes, or look at /demo.";
     const d = new Date(now);
-    if (DEMO_SCHEDULE.hoursUtc.includes(d.getUTCHours()) && d.getUTCMinutes() >= DEMO_SCHEDULE.minute - 5 && this.loadSched().lastSlot !== d.toISOString().slice(0, 13)) return "The sandbox is about to run its scheduled trade. Try again in a few minutes.";
+    const schedOn = now < DEMO_SCHEDULE.until && !existsSync(`${PATHS.data}/demo_schedule.off`);
+    if (schedOn && DEMO_SCHEDULE.hoursUtc.includes(d.getUTCHours()) && d.getUTCMinutes() >= DEMO_SCHEDULE.minute - 5 && this.loadSched().lastSlot !== d.toISOString().slice(0, 13)) return "The sandbox is about to run its scheduled trade. Try again in a few minutes.";
     if (jobs.some((j) => j.base === base)) return `The sandbox already holds a ${base}-PERP trial. Pick another market or try again in a few minutes.`;
     if (jobs.length >= TRY.maxOpen) return "The sandbox is busy with other trials. Try again in a few minutes, or look at /demo.";
     return undefined;
@@ -1037,6 +1069,8 @@ export class Bot {
       return this.openSandbox(u, "try", base, side, {
         margin: TRY.margin, leverage: TRY.leverage, tpPct: TRY.tpPct, slPct: TRY.slPct, holdMs: TRY.maxHoldMs, chat,
         check: async () => {
+          const again = this.trySandboxBusy(base); // the schedule may have started while this tap waited for the lock
+          if (again) return again;
           const acct = await this.venue.account(u.owner!);
           if (acct.positions.some((p) => p.base === base)) return `The sandbox already holds a ${base}-PERP position. Pick another market or try again in a few minutes.`;
           if (acct.positions.length >= TRY.maxOpen) return "The sandbox is busy with other trials. Try again in a few minutes, or look at /demo.";

@@ -10,7 +10,7 @@ const DEMO = "0x2A11e7388D1D2F9690f2636846d44b478f61bF08" as const;
 
 function setup(on = true) {
   const h = makeBot();
-  const owner = h.addUser(8684117854, DEMO);
+  const owner = h.addUser(5550001, DEMO);
   h.bot.venue.close = async (tk: { owner: string }, base: string) => {
     const list = h.state.positions.get(tk.owner.toLowerCase()) ?? [];
     const p = list.find((x) => x.base === base)!;
@@ -68,12 +68,12 @@ test("TR3: caps: 2 per person per day, one trial per market (from memory, no cha
   await h.handle(cb(704, "ty:XRP:l"));
   assert.match(h.to(704).at(-1)!.html, /One moment between trials/, "30 s cooldown per person");
   // trials end, caps
-  h.state.positions.clear(); await h.bot.sandboxSweep(); clearBuckets(h);
+  h.state.positions.clear(); await h.bot.sandboxSweep(Date.now() + 120_000); clearBuckets(h);
   await h.handle(cb(702, "ty:XRP:l"));
-  h.state.positions.clear(); await h.bot.sandboxSweep(); clearBuckets(h);
+  h.state.positions.clear(); await h.bot.sandboxSweep(Date.now() + 120_000); clearBuckets(h);
   await h.handle(cb(702, "ty:SOL:l"));
   assert.match(h.to(702).at(-1)!.html, /used your 2 live trials for today/);
-  h.state.positions.clear(); await h.bot.sandboxSweep(); clearBuckets(h);
+  h.state.positions.clear(); await h.bot.sandboxSweep(Date.now() + 120_000); clearBuckets(h);
   const acct = h.bot.venue.account;
   h.bot.venue.account = async (o: string) => ({ ...(await acct(o)), equity: 2.9 });
   await h.handle(cb(706, "ty:ETH:l"));
@@ -124,7 +124,7 @@ test("TR6: the trier hears how the trial ended: by its exit, or after the hold t
   clearBuckets(h);
   await h.handle(cb(721, "ty:SOL:l"));
   h.state.positions.clear(); // its TP fired (no close row in this fake log)
-  await h.bot.sandboxSweep();
+  await h.bot.sandboxSweep(Date.now() + 120_000);
   assert.match(h.to(721).at(-1)!.html, /Your SOL-PERP trial has ended|Your SOL-PERP trial is closed/);
 });
 
@@ -139,4 +139,13 @@ test("TR7: entry points appear only when trials are on: /demo and /start buttons
   assert.ok(h.cbData(h.to(732).at(-1)).includes("tr"));
   await h.handle(cb(733, "tr"));
   assert.deepEqual(h.cbData(h.to(733).at(-1)), ["ty:ETH:l", "ty:ETH:s", "ty:SOL:l", "ty:SOL:s", "ty:XRP:l", "ty:XRP:s"]);
+});
+
+test("TR8 (re-review): with the schedule off, its slot hours do not block trials", async () => {
+  const { h } = setup();
+  writeFileSync(`${PATHS.data}/demo_schedule.off`, "");
+  assert.equal(h.bot.trySandboxBusy("ETH", Date.parse("2026-10-29T11:30:00Z")), undefined);
+  rmSync(`${PATHS.data}/demo_schedule.off`);
+  assert.match(h.bot.trySandboxBusy("ETH", Date.parse("2026-10-29T11:30:00Z")), /about to run/);
+  assert.equal(h.bot.trySandboxBusy("ETH", Date.parse("2026-11-03T11:30:00Z")), undefined, "after the end date");
 });
