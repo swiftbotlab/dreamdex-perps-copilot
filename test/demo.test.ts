@@ -41,7 +41,7 @@ test("T12: /demo works without a user record and shows only valid demo rows, at 
   assert.match(out.html, /Last auto-exit<\/b>: 10-20 13:21 UTC SOL-PERP stop-loss/);
   assert.match(out.html, /Totals<\/b>: 7 orders \(3 opens, 4 closes\), 2 closed by the bot itself/);
   assert.match(out.html, /Somnia Reactivity<\/b>: 1 live mark stream \(ETH 42 pushes\)/);
-  assert.deepEqual(h.cbData(out), ["dc", "wd", "st"]);
+  assert.deepEqual(h.cbData(out), ["dc", "wd", "sd", "st"]);
 });
 
 test("T12: a second /demo within 15 s makes no new account read; /demo is rate limited per user", async () => {

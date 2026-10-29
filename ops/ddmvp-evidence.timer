@@ -1,0 +1,12 @@
+[Unit]
+Description=Perps Copilot evidence refresh, an hour after each scheduled demo trade (03:20, 11:20, 19:20 UTC)
+
+[Timer]
+OnCalendar=*-*-* 04:25:00 UTC
+OnCalendar=*-*-* 12:25:00 UTC
+OnCalendar=*-*-* 20:25:00 UTC
+RandomizedDelaySec=300
+Persistent=false
+
+[Install]
+WantedBy=timers.target

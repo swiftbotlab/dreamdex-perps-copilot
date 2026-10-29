@@ -9,7 +9,9 @@ import { chain } from "../src/venue.ts";
 
 const REPO = "https://github.com/swiftbotlab/dreamdex-perps-copilot";
 const BOT = "https://t.me/SwiftPerpsBot";
-const VIDEO = process.argv[2] ?? `${REPO}/releases/download/v1.0.0/demo.mp4`;
+// The demo video: argument, else evidence/video_url.txt (one https URL), else the mp4 on the v1.0.0 release.
+const videoFile = (() => { try { return readFileSync("evidence/video_url.txt", "utf8").trim(); } catch { return ""; } })();
+const VIDEO = process.argv[2] ?? (/^https:\/\/[^\s"<>]+$/.test(videoFile) ? videoFile : `${REPO}/releases/download/v1.0.0/demo.mp4`);
 const esc = (s: unknown) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 const HASH = /^0x[0-9a-fA-F]{64}$/, ADDR = /^0x[0-9a-fA-F]{40}$/;
 const tx = (h: string) => { if (!HASH.test(h)) throw new Error(`bad hash ${h}`); return `<a href="${EXPLORER_TX}${h}"><code>${h.slice(0, 10)}…${h.slice(-6)}</code></a>`; };

@@ -596,7 +596,7 @@ export class Bot {
       `\n<b>Totals</b>: ${t.orders} orders (${t.opens} opens, ${t.closes} closes), ${t.autoExits} closed by the bot itself (take-profit, stop-loss or guard)${t.unknown ? `, ${t.unknown} not confirmed at send` : ""}${hist.length ? `; including the earlier demo account${hist.length === 1 ? "" : "s"} ${hist.map((a) => addrLink(getAddress(a))).join(", ")}` : ""}.\n` +
       `<b>Somnia Reactivity</b>: ${w.length} live mark stream${w.length === 1 ? "" : "s"}${w.length ? ` (${w.map((x) => `${x.base} ${x.pushes} pushes`).join(", ")})` : ""}.\n` +
       `${this.linkLine()}.`,
-      [[{ text: "Sample PnL card", callback_data: "dc" }], [{ text: "Watch this account", callback_data: "wd" }], [{ text: "Start trading", callback_data: "st" }]]);
+      [[{ text: "Sample PnL card", callback_data: "dc" }], [{ text: "Watch this account", callback_data: "wd" }, { text: "Its chain-held stops", callback_data: "sd" }], [{ text: "Start trading", callback_data: "st" }]]);
   }
 
   private async demoCard(viewer: number, chat: number): Promise<void> {
@@ -1449,6 +1449,7 @@ export class Bot {
       if (data === "st") { await this.cmdStart(q.from.id, chat); return; }
       if (data === "wd") { const r = await this.ensureUser(q.from.id, chat, { key: false }); if (r) await this.cmdWatch(r.user, chat, this.demoAccount); return; }
       if (data === "sk") { await this.cmdStops(q.from.id, chat); return; }
+      if (data === "sd") { await this.cmdStops(q.from.id, chat, this.demoAccount); return; }
       const ty = /^ty:(ETH|SOL|XRP):([ls])$/.exec(data);
       if (ty) { await this.tryOrder(q.from.id, chat, ty[1]!, ty[2] === "l" ? "long" : "short"); return; }
       const wu = this.store.get(q.from.id);

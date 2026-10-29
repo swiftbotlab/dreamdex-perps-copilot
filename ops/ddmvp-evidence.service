@@ -1,0 +1,10 @@
+[Unit]
+Description=Perps Copilot: refresh and push the public evidence after scheduled demo trades (only when there are new orders)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/agent/agent/products/dreamdex-mvp
+ExecStart=/home/agent/agent/products/dreamdex-mvp/ops/evidence_refresh.sh
+TimeoutStartSec=900
+NoNewPrivileges=yes
+MemoryMax=600M
