@@ -2,6 +2,9 @@
 Description=Perps Copilot for dreamDEX (Telegram bot, Somnia Tokyo testnet; long polling, outbound only)
 After=network-online.target
 Wants=network-online.target
+# Never give up restarting: the in-process watchdog exits 75 when it cannot heal the chain link, and an RPC
+# outage can last longer than any burst limit. The growing RestartSec below keeps an outage loop slow.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -11,6 +14,8 @@ WorkingDirectory=/home/agent/agent/products/dreamdex-mvp
 ExecStart=/home/agent/agent/products/dreamdex-mvp/ops/run_sandboxed.sh bot
 Restart=always
 RestartSec=15
+RestartSteps=5
+RestartMaxDelaySec=300
 RestartPreventExitStatus=2
 NoNewPrivileges=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK

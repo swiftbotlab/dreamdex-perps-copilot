@@ -63,6 +63,8 @@ export const LIMITS = {
   watchIdleMs: 7 * 24 * 3_600_000,    // watches end after this long without a message from the watcher (they are told)
   watchUsersMax: 1_000,               // watch-only records (no key), separate from maxUsers
   watchWarnMinGapMs: 60_000,          // watched positions: once per position, again only when the distance halves
+  // chain-link watchdog (src/watchdog.ts): one probe every 30 s; 6 failed in a row = rebuild, 6 more = exit 75
+  watchdogMs: 30_000,
   // shutdown
   shutdownDrainMs: 70_000,            // finish in-flight orders before exiting (systemd stops after 90 s)
   unresolvedTtlMs: 30 * 60_000,       // forget an unconfirmed send's marker after this long

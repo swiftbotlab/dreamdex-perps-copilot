@@ -14,6 +14,7 @@ import { readEnvFile } from "./secrets.ts";
 import { autoKind, Store, type CardRec, type OrderRow, type User } from "./store.ts";
 import { Telegram, type Button, type TgCallback, type TgMessage, type TgUpdate } from "./tg.ts";
 import { findLinkedOwners, OutcomeUnknown, UserError, Venue, type AccountView, type Position, type TradeResult } from "./venue.ts";
+import { RpcWatchdog } from "./watchdog.ts";
 
 const log = (...a: unknown[]) => console.log(new Date().toISOString(), ...a);
 
@@ -70,6 +71,10 @@ export class Bot {
   private releaseLock?: () => void;
   private stopping = false;
   private stopAt = 0;
+  /** Process exit code after a clean stop (the watchdog sets 75 when the chain link could not be healed). */
+  exitCode = 0;
+  readonly watchdog: RpcWatchdog;
+  private timers: NodeJS.Timeout[] = [];
 
   constructor() {
     const bot = readEnvFile(PATHS.botEnv);
@@ -79,7 +84,25 @@ export class Bot {
     this.store = new Store(PATHS.data);
     this.protector = new Protector(this.venue, this.store, (u, b, f, r, o) => this.autoClose(u, b, f, r, o), (u, b, t) => this.liqWarn(u, b, t), log);
     this.protector.onWatch((u, a, b, t) => this.watchWarn(u, a, b, t), (u, a, b, s) => this.watchGone(u, a, b, s));
+    this.watchdog = new RpcWatchdog({
+      probe: () => this.venue.probe(),
+      rebuild: async () => {
+        const n = await this.venue.rebuildClient();
+        this.protector.resetStreams();
+        log(`rpc watchdog: rebuilt the chain client (${n} cached socket${n === 1 ? "" : "s"} closed), push streams re-subscribed`);
+      },
+      exit: (code) => {
+        this.exitCode = code;
+        this.requestStop();
+        // Backstop: if the drain hangs on a dead link, exit anyway (systemd stops waiting at 90 s).
+        setTimeout(() => process.exit(code), LIMITS.shutdownDrainMs + 10_000).unref();
+      },
+      log,
+    });
   }
+
+  /** One watchdog round: probe the chain client, and count a sweep in which every account read failed. */
+  watchdogRound() { return this.watchdog.round(this.protector.sweepFailed()); }
 
   async start(): Promise<void> {
     // First, before any chain or Telegram traffic: one instance only (exit 3 = systemd retries in 15 s).
@@ -124,6 +147,8 @@ export class Bot {
       "dreamDEX perps from Telegram: orders, TP/SL, liquidation alerts, copyable PnL cards. Testnet.",
     ).catch((e) => log("setDescription", String(e)));
     this.protector.start();
+    this.timers.push(setInterval(() => void this.watchdogRound().catch((e) => log("watchdog error", String(e).slice(0, 160))), LIMITS.watchdogMs));
+    void this.watchdogRound().catch(() => {}); // first check right away, so /status shows a verified link
     setInterval(() => void this.housekeeping().catch((e) => log("housekeeping error", String(e).slice(0, 160))), 10 * 60_000).unref();
     await this.poll();
     await this.shutdown();
@@ -135,6 +160,7 @@ export class Bot {
     if (this.stopping) return;
     this.stopping = true;
     this.stopAt = Date.now();
+    for (const t of this.timers) clearInterval(t);
     this.protector.stop();
     log("stopping: finishing in-flight work");
   }
@@ -482,7 +508,16 @@ export class Bot {
       `Open positions: ${acct.positions.length}\nBot key gas: ${gas.toFixed(3)} STT\n` +
       `Liquidation warning: within ${u.liqWarnPct}% · guard: ${u.guardPct ? `auto-close within ${u.guardPct}%` : "off"}\n` +
       (rules ? `<b>Watched exits</b>\n${h(rules)}\n` : "") +
-      `Somnia Reactivity: ${w.length} live mark stream${w.length === 1 ? "" : "s"}${w.length ? ` (${w.map((x) => `${x.base} ${x.pushes} pushes`).join(", ")})` : ""}`);
+      `Somnia Reactivity: ${w.length} live mark stream${w.length === 1 ? "" : "s"}${w.length ? ` (${w.map((x) => `${x.base} ${x.pushes} pushes`).join(", ")})` : ""}\n` +
+      this.linkLine());
+  }
+
+  /** The watchdog's view of the chain link, for /status and /demo. */
+  private linkLine(): string {
+    const w = this.watchdog;
+    if (w.streak) return `Chain link: degraded (${w.streak} failed check${w.streak === 1 ? "" : "s"} in a row; the bot reconnects by itself)`;
+    if (w.lastOkAt === undefined) return "Chain link: starting up";
+    return `Chain link: OK, last verified ${Math.max(0, Math.round((Date.now() - w.lastOkAt) / 1000))} s ago`;
   }
 
   // ---------- /demo: a live account, no wallet needed ----------
@@ -519,7 +554,8 @@ export class Bot {
       (d.orders.length ? `\n<b>Last bot orders</b>\n${d.orders.map((r) => this.orderLine(r)).join("\n")}\n` : "") +
       (t.lastAuto ? `\n<b>Last auto-exit</b>: ${t.lastAuto.t.slice(5, 16).replace("T", " ")} UTC ${t.lastAuto.market} ${autoKind(t.lastAuto.reason)} · ${txLink(t.lastAuto.hash)}\n` : "") +
       `\n<b>Totals</b>: ${t.orders} orders (${t.opens} opens, ${t.closes} closes), ${t.autoExits} closed by the bot itself (take-profit, stop-loss or guard)${t.unknown ? `, ${t.unknown} not confirmed at send` : ""}.\n` +
-      `<b>Somnia Reactivity</b>: ${w.length} live mark stream${w.length === 1 ? "" : "s"}${w.length ? ` (${w.map((x) => `${x.base} ${x.pushes} pushes`).join(", ")})` : ""}.`,
+      `<b>Somnia Reactivity</b>: ${w.length} live mark stream${w.length === 1 ? "" : "s"}${w.length ? ` (${w.map((x) => `${x.base} ${x.pushes} pushes`).join(", ")})` : ""}.\n` +
+      `${this.linkLine()}.`,
       [[{ text: "Sample PnL card", callback_data: "dc" }], [{ text: "Watch this account", callback_data: "wd" }], [{ text: "Start trading", callback_data: "st" }]]);
   }
 
@@ -1143,5 +1179,6 @@ export class Bot {
 }
 
 if (process.argv[1]?.endsWith("bot.mjs") || process.argv[1]?.endsWith("bot.ts")) {
-  new Bot().start().then(() => process.exit(0), (e) => { console.error("fatal:", String(e instanceof Error ? e.message : e).slice(0, 300)); process.exit(1); });
+  const bot = new Bot();
+  bot.start().then(() => process.exit(bot.exitCode), (e) => { console.error("fatal:", String(e instanceof Error ? e.message : e).slice(0, 300)); process.exit(1); });
 }

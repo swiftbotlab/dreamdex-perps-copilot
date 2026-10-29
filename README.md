@@ -164,7 +164,7 @@ Requirements: Node 22, a Telegram bot token, Linux with `bwrap` for the jail (op
 ```bash
 git clone https://github.com/swiftbotlab/dreamdex-perps-copilot && cd dreamdex-perps-copilot
 npm ci --ignore-scripts
-npm test                      # 93 tests: parsing, key vault, card, protection, close races, send outcomes, card copies, /watch, /demo, shutdown
+npm test                      # 102 tests: parsing, key vault, card, protection, close races, send outcomes, card copies, /watch, /demo, shutdown, chain-link watchdog
 npm run build                 # bundles dist/bot.mjs + dist/resvg.wasm
 
 # secrets live outside the repo, one KEY=VALUE per line, chmod 600

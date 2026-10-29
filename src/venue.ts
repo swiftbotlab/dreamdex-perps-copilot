@@ -3,7 +3,8 @@
 // belong to the user's dreamDEX account; the key only pays gas and cannot move funds.
 import { ORDER_TYPE, SOMNIA_TESTNET_ADDRESSES, SomniaMarkets } from "@somnia-chain/markets-sdk";
 import { createPublicClient, defineChain, formatUnits, http, parseAbi, type PublicClient } from "viem";
-import { CHAIN_ID, INDEXER_URL, LIMITS, RPC_URL, WS_URL } from "./config.ts";
+import { socketClientCache } from "viem/utils";
+import { CHAIN_ID, DEMO_ACCOUNT, INDEXER_URL, LIMITS, RPC_URL, WS_URL } from "./config.ts";
 import { alignPrice, alignQuantity, perpMarkets, toRaw, type PerpMarket } from "./vendor/perp-core/markets.ts";
 import { createTradingKey, linkStatus, placeFor, SendError, type TradingKey } from "./vendor/perp-core/operator.ts";
 import { KeyedLock } from "./locks.ts";
@@ -58,8 +59,32 @@ export class Venue {
   async init(): Promise<void> {
     const id = await this.pub.getChainId();
     if (id !== CHAIN_ID) throw new Error(`refusing to start: RPC chain id ${id}, expected ${CHAIN_ID} (testnet only)`);
-    this.exchange = new SomniaMarkets({ indexerUrl: INDEXER_URL, chain, wsRpcUrl: WS_URL, addresses: SOMNIA_TESTNET_ADDRESSES });
+    this.exchange = this.makeExchange();
     await this.reloadMarkets(true);
+  }
+
+  private makeExchange(): SomniaMarkets {
+    return new SomniaMarkets({ indexerUrl: INDEXER_URL, chain, wsRpcUrl: WS_URL, addresses: SOMNIA_TESTNET_ADDRESSES });
+  }
+
+  /** Watchdog probe: the same read the position sweep does (block pin + account state), over the SDK's socket. */
+  async probe(): Promise<void> {
+    const m = this.list()[0];
+    if (!m) throw new Error("no markets loaded");
+    await this.exchange.client.getMarginAccount(m.info.marginBank, DEMO_ACCOUNT);
+  }
+
+  /**
+   * Replace a stuck SDK client: release the old exchange, close every cached socket for the WebSocket URL
+   * (viem keeps a socket that gave up reconnecting in its cache, and a new client for the same URL would
+   * get that dead socket back), then build a fresh exchange. Reads in flight on the old one just fail.
+   */
+  async rebuildClient(): Promise<number> {
+    const old = this.exchange;
+    await Promise.race([old?.close().catch(() => undefined), new Promise((r) => setTimeout(r, 5_000))]);
+    const closed = closeSockets(WS_URL);
+    this.exchange = this.makeExchange();
+    return closed;
   }
 
   async reloadMarkets(force = false): Promise<void> {
@@ -314,6 +339,16 @@ export class Venue {
     const realizedPnl = avgPrice !== undefined ? (avgPrice - entry) * filledBase * (posSide === "long" ? 1 : -1) : undefined;
     return { hash: res.hash, filledBase, avgPrice, requestedBase: Number(formatUnits(qty, m.info.baseDecimals)), base, side, realizedPnl, entry, prevSize: Number(formatUnits(abs, m.info.baseDecimals)) };
   }
+}
+
+/** Close (and so evict) every cached viem socket client for `url`; the next request opens a new socket. Returns how many. */
+export function closeSockets(url: string): number {
+  let n = 0;
+  for (const c of [...socketClientCache.values()]) {
+    if (c.url !== url) continue;
+    try { c.close(); n++; } catch { /* already dead */ }
+  }
+  return n;
 }
 
 const REGISTRY = "0x6B2FbfeD328FF5F20C0BE7D3C3437613aFFE8D3a" as const; // OperatorPermissionsRegistry on Hideki

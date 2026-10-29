@@ -97,6 +97,8 @@ export function makeBot(opts: { mark?: number; maxLev?: Record<string, number> }
     dropUser: () => {},
     idle: async () => {},
     stop: () => {},
+    sweepFailed: () => ({ failed: false }),
+    resetStreams: () => {},
   };
   const addUser = (id: number, owner?: `0x${string}`) => {
     const { address, sealed } = bot.vault.create(id);

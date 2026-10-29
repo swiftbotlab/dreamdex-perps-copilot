@@ -9,12 +9,13 @@ import { createPublicClient, decodeAbiParameters, toFunctionSelector, webSocket 
 import { LIMITS, WS_URL } from "./config.ts";
 import { fmtPrice, liqDistancePct, triggered, type Side } from "./parse.ts";
 import type { Store, User } from "./store.ts";
-import { chain, type AccountView, type Venue } from "./venue.ts";
+import { chain, closeSockets, type AccountView, type Venue } from "./venue.ts";
 
 const MARK_SEL = toFunctionSelector("tryGetMarkPrice()");
 const SILENT_MS = 15_000;
 const RESUB_MS = 90_000;
 const REFRESH_MS = 30_000;
+const SUB_FAIL_RESET = 3; // subscribe failures in a row before the push socket is reopened
 
 /** A linked user's position as last read. `owner` (lowercase) is the account it was read from. */
 export interface Held { userId: number; owner: string; base: string; pool: `0x${string}`; side: Side; size: number; entry: number; liq?: number }
@@ -45,7 +46,10 @@ export class Protector {
   private running = new Set<Promise<unknown>>();     // acts in flight (drained on shutdown)
   private stopped = false;
   private ws = createPublicClient({ chain, transport: webSocket(WS_URL, { keepAlive: { interval: 20_000 }, reconnect: { attempts: 1_000, delay: 2_000 }, timeout: 20_000 }) });
-  stats = { pushes: 0, polls: 0, triggers: 0 };
+  stats = { pushes: 0, polls: 0, triggers: 0, streamResets: 0 };
+  /** The last periodic sweep of linked accounts: how many refreshes worked and failed (watchdog input). */
+  lastSweep?: { at: number; ok: number; failed: number; error?: string };
+  private subFailStreak = 0;
   private timers: NodeJS.Timeout[] = [];
 
   constructor(private venue: Venue, private store: Store, private act: Act, private warn: Warn, private log = console.log) {}
@@ -120,10 +124,28 @@ export class Protector {
       const u = this.store.get(h.userId);
       if (!u || u.owner?.toLowerCase() !== h.owner) this.dropUser(h.userId); // gone, unlinked or relinked
     }
+    let ok = 0, failed = 0, error: string | undefined;
     for (const u of this.store.all()) {
       if (!u.owner) continue;
-      try { await this.refreshUser(u); } catch (e) { this.log("refresh failed", String(e).slice(0, 120)); }
+      try { await this.refreshUser(u); ok++; } catch (e) { failed++; error = String(e).slice(0, 120); this.log("refresh failed", error); }
     }
+    this.lastSweep = { at: Date.now(), ok, failed, error };
+  }
+
+  /** True when the last sweep (within `maxAgeMs`) had accounts to read and every read failed. */
+  sweepFailed(maxAgeMs = 2 * REFRESH_MS): { failed: boolean; error?: string } {
+    const s = this.lastSweep;
+    if (!s || Date.now() - s.at > maxAgeMs) return { failed: false };
+    return { failed: s.failed > 0 && s.ok === 0, error: s.error };
+  }
+
+  /** Drop every push subscription and subscribe again (after the sockets were reopened). */
+  resetStreams(): void {
+    for (const s of this.subs.values()) void s.unsubscribe?.().catch(() => {});
+    this.subs.clear();
+    this.subFailStreak = 0;
+    this.stats.streamResets++;
+    if (!this.stopped) this.syncSubs();
   }
 
   // ---------- watched accounts ----------
@@ -223,9 +245,11 @@ export class Protector {
         },
         onError: (e: unknown) => this.log("watch error", pool.slice(0, 10), String(e).slice(0, 120)),
       });
+      this.subFailStreak = 0;
       if (this.subs.get(pool) !== sub) { await unsubscribe().catch(() => {}); return; }
       sub.unsubscribe = unsubscribe;
     } catch (e) {
+      this.subFailStreak++;
       this.log("subscribe failed", pool.slice(0, 10), String(e).slice(0, 120));
     }
   }
@@ -241,6 +265,13 @@ export class Protector {
       const mark = await this.venue.mark(m).catch(() => undefined);
       if (mark) { this.stats.polls++; await this.onMark(pool, mark, "poll"); }
       if (quiet > RESUB_MS) {
+        if (this.subFailStreak >= SUB_FAIL_RESET) {
+          // A socket that gave up reconnecting stays cached by URL and refuses every new subscription: reopen it.
+          const n = closeSockets(WS_URL);
+          this.log(`push streams: ${this.subFailStreak} subscribe failures in a row; reopened the WebSocket (${n} socket${n === 1 ? "" : "s"} closed)`);
+          this.subFailStreak = 0;
+          this.stats.streamResets++;
+        }
         this.log("re-subscribing", pool.slice(0, 10), "quiet", Math.round(quiet / 1000), "s");
         void s.unsubscribe?.().catch(() => {});
         this.subs.delete(pool);
