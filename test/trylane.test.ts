@@ -147,5 +147,5 @@ test("TR8 (re-review): with the schedule off, its slot hours do not block trials
   assert.equal(h.bot.trySandboxBusy("ETH", Date.parse("2026-10-29T11:30:00Z")), undefined);
   rmSync(`${PATHS.data}/demo_schedule.off`);
   assert.match(h.bot.trySandboxBusy("ETH", Date.parse("2026-10-29T11:30:00Z")), /about to run/);
-  assert.equal(h.bot.trySandboxBusy("ETH", Date.parse("2026-11-03T11:30:00Z")), undefined, "after the end date");
+  assert.equal(h.bot.trySandboxBusy("ETH", Date.parse("2026-11-17T11:30:00Z")), undefined, "after the end date");
 });

@@ -61,7 +61,7 @@ test("SC2: busy -> wait and retry within the hour; low equity, `until` and the o
   assert.match(await k.bot.demoScheduleTick(at("2026-10-29T19:21:00Z")), /^skip: equity 1\.50 below 2\.8/);
   assert.equal(await k.bot.demoScheduleTick(at("2026-10-29T19:30:00Z")), "done", "an equity skip uses the slot");
   k.bot.venue.account = acct;
-  assert.equal(await k.bot.demoScheduleTick(at("2026-11-02T03:21:00Z")), "off");
+  assert.equal(await k.bot.demoScheduleTick(at("2026-11-16T03:21:00Z")), "off");
   writeFileSync(`${PATHS.data}/demo_schedule.off`, "");
   assert.equal(await k.bot.demoScheduleTick(at("2026-10-30T03:21:00Z")), "off");
   assert.equal(k.state.opens.length, 0);

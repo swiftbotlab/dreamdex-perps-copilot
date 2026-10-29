@@ -20,7 +20,7 @@ export const DEMO_ACCOUNT = "0x2A11e7388D1D2F9690f2636846d44b478f61bF08" as cons
  * position at a time, skipped below the equity floor, off after `until` or while data/demo_schedule.off exists.
  */
 export const DEMO_SCHEDULE = {
-  hoursUtc: [3, 11, 19], minute: 20, until: Date.parse("2026-11-02T00:00:00Z"),
+  hoursUtc: [3, 11, 19], minute: 20, until: Date.parse("2026-11-16T00:00:00Z"),
   margin: 2.4, leverage: 5, tpPct: 0.3, slPct: 0.3, maxHoldMs: 45 * 60_000, minEquity: 2.8,
   markets: ["XRP", "SOL", "ETH"], tickMs: 60_000,
 };
