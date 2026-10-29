@@ -88,6 +88,35 @@
   the distance to liquidation has halved, after it left the zone (2x the warning distance) and came
   back, or after the position changed size.
 
+## Chain-held stops (`/stops`) and stop-health alerts
+- Read only: `/stops` and the alert pass never send a transaction and hold no key for the accounts they
+  read; a linked bot key cannot arm or cancel dreamDEX stops anyway (only the account can).
+- Indexer rows are untrusted. A stop is kept only when its registry is the known market's own stop
+  registry and its owner is the account asked about, with well-formed numbers; every one is then read
+  from its registry (one chain batch), and that read is what the bot shows. Ids found in the registries'
+  own `PendingOrderCreated` logs (stops newer than the indexer) are collected only for linked accounts,
+  confirmed the same way, and shown only to that account's own user. Drop and cancel reasons map to
+  fixed text; raw indexer strings never reach a message.
+- Limits: 4 `/stops` per user per minute; lookups of other accounts also share a global 60 per minute;
+  one read per account per 15 s is shared by `/stops`, `/positions` and the alert pass; one `getLogs`
+  per pass for all linked accounts (at most 50, rotating); a reply keeps whole market sections under
+  Telegram's limit; a warning about the same stop and problem is sent at most once a day, and only
+  marked as sent once Telegram accepted it.
+
+## Chain-link watchdog
+- Every 30 s a block-number read over the SDK's WebSocket. 6 failed checks in a row close the cached
+  sockets for that URL and build a fresh client (sends use HTTP and are not affected); 6 more stop the
+  bot through the normal drain (orders in flight finish, at most 70 s) and exit 75, and systemd restarts
+  it (`Restart=always`, delays growing to 5 min, no start limit). A sweep counts as failed only when
+  every account read failed on the link itself, so a read that reverts for one account cannot cause
+  restarts. A push stream that cannot subscribe reopens only its own socket, at most every 5 minutes.
+
+## Scheduled demo trades
+- Only the demo account named in `src/config.ts`, only when its linked user record exists; one 12 USDso
+  position at a time (2.4 USDso x 5x) with a bot-side TP/SL 0.3 % away, flattened after 45 minutes;
+  three slots a day, never repeated after a restart (the slot is recorded before the order); skipped
+  below 2.8 USDso equity; off after 2026-11-02 or while `data/demo_schedule.off` exists.
+
 ## Send outcomes
 - Every order send is labelled by the step that failed: the simulation or the preparation (nonce, fee
   and chain-id reads, local signing; nothing was posted), the post of the signed transaction, the

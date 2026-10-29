@@ -1,0 +1,73 @@
+{
+ "title": "Chain-held stop check, live on Somnia Tokyo testnet (2026-10-29)",
+ "account": "0x2A11e7388D1D2F9690f2636846d44b478f61bF08",
+ "note": "Owner-side steps (arming the TP/SL bracket, resting an order, cancelling) were sent by the account owner with the dreamDEX SDK, as a trader does in the app. The bot only read them and answered in Telegram; the quotes are the bot's messages, copied as sent.",
+ "steps": [
+  {
+   "t": "2026-10-29T01:05:24Z",
+   "who": "bot",
+   "what": "/long XRP 2.4 5x tp 1% sl 1%: opened 9.1 XRP long (bot-side TP/SL 1% away)",
+   "tx": "0x4f70e96e3db40293c1f44a96c516ab1ef9f72b07c396047766da437416fb424a"
+  },
+  {
+   "t": "2026-10-29T01:05:46Z",
+   "who": "owner",
+   "what": "Armed a linked dreamDEX TP/SL bracket on the chain: TP 1.3363, SL 1.2968, whole position (0.15 STT locked per stop)",
+   "tx": "0xe70ec4afd59ad666bbb910309f6374958544bcc42bad5d126ed806567bb69346"
+  },
+  {
+   "t": "2026-10-29T01:14:19Z",
+   "who": "bot",
+   "what": "/stops",
+   "quote": "✅ TP 1.3363 (market, whole position) · 1.48% from the mark: OK, closes 9.1 XRP when it fires\n✅ SL 1.2968 (market, whole position) · 1.52% from the mark: OK, closes 9.1 XRP when it fires"
+  },
+  {
+   "t": "2026-10-29T01:15:16Z",
+   "who": "owner",
+   "what": "Rested a post-only sell of 7 XRP 20% above the market (it cannot fill soon). Pool capacity read: position 9.1, pending sells 7, effective reducing capacity 2.1 XRP; the pool minimum is 6.9 XRP",
+   "tx": "0x97afaf89b62d1d6bb6373eff49e529e95a1994e6c2f3bea59d8634b7a566ca0b"
+  },
+  {
+   "t": "2026-10-29T01:15:21Z",
+   "who": "bot",
+   "what": "/stops",
+   "quote": "⚠️ SL 1.2968 (market, whole position) · 1.48% from the mark: will close NOTHING when it fires. Your resting sell orders on XRP-PERP (7 XRP) use up the position's closing capacity, so the stop is dropped (ReduceOnlyBelowMinQty) and its fee is spent. Cancel those orders to restore it"
+  },
+  {
+   "t": "2026-10-29T01:16:12Z",
+   "who": "bot",
+   "what": "Unprompted alert, 56 s after the resting order (the stop-health pass runs every minute)",
+   "quote": "⚠️ Stop health · XRP-PERP\nSL 1.2968 (market, whole position) · 1.53% from the mark: will close NOTHING when it fires. ..."
+  },
+  {
+   "t": "2026-10-29T01:16:27Z",
+   "who": "owner",
+   "what": "Cancelled the resting sell; capacity back to 9.1 XRP",
+   "tx": "0x13fdd598295109c0b7a3a2da159de5c02eb0b154f137dfd7dc28504c6c427eec"
+  },
+  {
+   "t": "2026-10-29T01:16:34Z",
+   "who": "bot",
+   "what": "/positions",
+   "quote": "chain-held: TP 1.3363 ✅ · SL 1.2968 ✅\nbot-side: TP 1.3315 SL 1.3051"
+  },
+  {
+   "t": "2026-10-29T01:16:52Z",
+   "who": "bot",
+   "what": "/close XRP: closed 9.1 XRP",
+   "tx": "0x2e6d136d76c96a6ee7e79d711d0fb7cfab8c8cea9b8dc3c764c1a3ffae275c79"
+  },
+  {
+   "t": "2026-10-29T01:17:09Z",
+   "who": "bot",
+   "what": "Unprompted alert: the bracket outlived its position",
+   "quote": "⚠️ Stop health · XRP-PERP\nTP 1.3363 (market, whole position): no open XRP-PERP position, so it places nothing if it fires and still spends its STT fee."
+  },
+  {
+   "t": "2026-10-29T01:17:34Z",
+   "who": "owner",
+   "what": "Cancelled both stops (STT fee refunded)",
+   "tx": "0xd24b080b22c913378cb4b180cdd43286e76d631ac04e0cccc0f31d0938f065e6"
+  }
+ ]
+}
