@@ -5,7 +5,7 @@ import { LIMITS } from "./config.ts";
 import type { SealedKey } from "./keys.ts";
 import type { Side } from "./parse.ts";
 
-export interface Rule { tp?: number; sl?: number; side: Side; setAt: number }
+export interface Rule { tp?: number; sl?: number; side: Side; setAt: number; quiet?: boolean } // quiet: a scheduled demo trade's exits send no chat message
 export interface OpenInfo { margin: number; leverage: number; at: number }
 /** `lev`: leverage of the bot order that opened it, if any; `full`: the close left no position (undefined in old records = full). */
 export interface ClosedTrade { base: string; side: Side; entry: number; exit: number; size: number; pnl: number; roePct?: number; at: number; reason: string; lev?: number; full?: boolean }

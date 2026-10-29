@@ -14,6 +14,16 @@ export const APP_URL = "https://app.testnet.dreamdex.io";
  * grant the app's Link a bot writes.
  */
 export const DEMO_ACCOUNT = "0x2A11e7388D1D2F9690f2636846d44b478f61bF08" as const;
+/**
+ * Scheduled demo trades: the bot opens one small position on its own demo account in each slot (UTC hours below,
+ * from minute 20), with a bot-side TP/SL 0.3% away, and flattens it after 45 minutes if neither fired. One
+ * position at a time, skipped below the equity floor, off after `until` or while data/demo_schedule.off exists.
+ */
+export const DEMO_SCHEDULE = {
+  hoursUtc: [3, 11, 19], minute: 20, until: Date.parse("2026-11-02T00:00:00Z"),
+  margin: 2.4, leverage: 5, tpPct: 0.3, slPct: 0.3, maxHoldMs: 45 * 60_000, minEquity: 2.8,
+  markets: ["XRP", "SOL", "ETH"], tickMs: 60_000,
+};
 /** Earlier demo accounts whose bot orders still count in /demo's history (Oct 20-26: 0x0e7E…3817). */
 export const DEMO_HISTORY = ["0x0e7E8DF6Eac2E14165b4fA4CB2BD4e445d0E3817"] as const;
 

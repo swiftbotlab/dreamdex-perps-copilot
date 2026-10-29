@@ -2,8 +2,9 @@
 // one global cap on concurrent transactions. User text is parsed by src/parse.ts only; nothing
 // user-supplied reaches a shell, an eval, a file path or an SVG without validation.
 import { createHash, randomBytes } from "node:crypto";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { getAddress } from "viem";
-import { APP_URL, CHAIN_NAME, DEMO_ACCOUNT, DEMO_HISTORY, EXPLORER_ADDR, EXPLORER_TX, LIMITS, PATHS } from "./config.ts";
+import { APP_URL, CHAIN_NAME, DEMO_ACCOUNT, DEMO_HISTORY, DEMO_SCHEDULE, EXPLORER_ADDR, EXPLORER_TX, LIMITS, PATHS } from "./config.ts";
 import { renderCard } from "./card.ts";
 import { acquireInstanceLock } from "./instance.ts";
 import { KeyVault, type SealedKey } from "./keys.ts";
@@ -159,6 +160,7 @@ export class Bot {
     this.timers.push(setInterval(() => void this.watchdogRound().catch((e) => log("watchdog error", String(e).slice(0, 160))), LIMITS.watchdogMs));
     void this.watchdogRound().catch(() => {}); // first check right away, so /status shows a verified link
     this.timers.push(setInterval(() => void this.stopHealthRound().catch((e) => log("stop check error", String(e).slice(0, 160))), LIMITS.stopCheckMs));
+    this.timers.push(setInterval(() => void this.demoScheduleTick().then((r) => { if (r.startsWith("opened") || r.startsWith("skip")) log("demo schedule:", r); }).catch((e) => log("demo schedule error", String(e).slice(0, 160))), DEMO_SCHEDULE.tickMs));
     setInterval(() => void this.housekeeping().catch((e) => log("housekeeping error", String(e).slice(0, 160))), 10 * 60_000).unref();
     await this.poll();
     await this.shutdown();
@@ -322,7 +324,9 @@ export class Bot {
   }
 
   /** Send a message. If Telegram says the user blocked the bot (or the chat is gone), mark them so pings stop. */
+  /** Send a message. Chat 0 = no chat (a scheduled demo trade): nothing is sent. */
   private say(chat: number, html: string, buttons?: Button[][]) {
+    if (chat === 0) return Promise.resolve(undefined);
     return this.tg.sendMessage(chat, html, buttons).catch((e) => {
       const msg = String(e instanceof Error ? e.message : e);
       log("send failed", msg.slice(0, 120));
@@ -560,7 +564,8 @@ export class Bot {
     const lat = auto && r.latencyMs !== undefined ? `, closed ${(r.latencyMs / 1000).toFixed(1)} s after the ${r.trigSrc === "poll" ? "polled" : "pushed"} mark crossed` : "";
     const tag = r.kind === "unknown" ? "outcome not confirmed at send" : auto ? `auto: ${auto}${lat}` : r.reason ? h(r.reason.slice(0, 40)) : "";
     const fill = r.filled !== undefined ? ` ${r.filled}${r.avgPrice !== undefined ? ` @ ${fmtPrice(r.avgPrice)}` : ""}` : "";
-    return `${r.t.slice(5, 16).replace("T", " ")} ${r.kind} ${r.market} ${r.side}${fill}${tag ? ` · ${tag}` : ""}${r.via === "card" ? " · card copy" : ""} · ${txLink(r.hash)}`;
+    const via = r.via === "card" ? " · card copy" : r.via === "schedule" ? " · scheduled demo trade" : "";
+    return `${r.t.slice(5, 16).replace("T", " ")} ${r.kind} ${r.market} ${r.side}${fill}${tag ? ` · ${tag}` : ""}${via} · ${txLink(r.hash)}`;
   }
 
   private async cmdDemo(id: number, chat: number): Promise<void> {
@@ -657,7 +662,7 @@ export class Bot {
     await this.posLock.run(`${tk.owner.toLowerCase()}:${p.base}`, () => this.openLocked(u, chat, side, p, tk));
   }
 
-  private async openLocked(u: User, chat: number, side: Side, p: OpenCmd, tk: ReturnType<Bot["tk"]>, opts: { maxTouchPct?: number; via?: "card"; card?: string } = {}): Promise<TradeResult | undefined> {
+  private async openLocked(u: User, chat: number, side: Side, p: OpenCmd, tk: ReturnType<Bot["tk"]>, opts: { maxTouchPct?: number; via?: "card" | "schedule"; card?: string; quiet?: boolean } = {}): Promise<TradeResult | undefined> {
     this.notStopping();
     const m = this.venue.market(p.base)!;
     await this.checkUnresolved(tk, p.base);
@@ -700,7 +705,7 @@ export class Bot {
         notes.push(`SL kept at ${fmtPrice(old.sl)} (tighter than 3% from this fill)`); // a copy's preset stop never loosens the user's own
         continue;
       }
-      u.rules[p.base] = { ...(old ?? { side, setAt: Date.now() }), side, [k]: v };
+      u.rules[p.base] = { ...(old ?? { side, setAt: Date.now() }), side, [k]: v, ...(opts.quiet ? { quiet: true } : {}) };
       notes.push(`${k.toUpperCase()} ${fmtPrice(v)} watched`);
     }
     this.store.save();
@@ -794,8 +799,9 @@ export class Bot {
 
   private async autoClose(u: User, base: string, fraction: number, reason: string, opt: { kind: "tp" | "sl" | "guard"; limit?: number; side: Side; owner?: string; at?: number; source?: "push" | "poll" }): Promise<void> {
     log("auto-close", base, opt.kind, reason, opt.source ?? "");
+    const chat = u.rules[base]?.quiet ? 0 : u.id; // a scheduled demo trade's exit is logged, not messaged
     try {
-      await this.doClose(u, u.id, base, fraction, reason, { limit: opt.limit, expectSide: opt.side, auto: true, owner: opt.owner, trigAt: opt.at, trigSrc: opt.source });
+      await this.doClose(u, chat, base, fraction, reason, { limit: opt.limit, expectSide: opt.side, auto: true, owner: opt.owner, trigAt: opt.at, trigSrc: opt.source });
     } catch (e) {
       const msg = e instanceof UserError ? e.message : "chain error";
       log("auto-close failed", base, opt.kind, String(e instanceof Error ? e.message : e).slice(0, 200));
@@ -851,6 +857,49 @@ export class Bot {
     });
     const buttons = acct.positions.slice(0, 6).map((p) => [{ text: `Close ${p.base}`, callback_data: closeData(owner, p.base, 100) }, { text: `Card ${p.base}`, callback_data: `cd:${p.base}` }]);
     await this.say(chat, `${lines.join("\n\n")}\n\nEquity ${fmtUsd(acct.equity)} USDso · margin status ${h(acct.status)}`, buttons);
+  }
+
+  // ---------- scheduled demo trades (fresh on-chain evidence, no chat messages) ----------
+  private schedFile(): string { return `${PATHS.data}/demo_schedule.json`; }
+  private loadSched(): { lastSlot?: string; runs?: number } {
+    try { const j = JSON.parse(readFileSync(this.schedFile(), "utf8")) as { lastSlot?: unknown; runs?: unknown }; return { lastSlot: typeof j.lastSlot === "string" ? j.lastSlot : undefined, runs: Number.isInteger(j.runs) ? (j.runs as number) : 0 }; } catch { return { runs: 0 }; }
+  }
+
+  /** Once per slot: one capped order on the demo account with a bot-side TP/SL; flattened after maxHoldMs. Returns what it did. */
+  async demoScheduleTick(now = Date.now()): Promise<string> {
+    const S = DEMO_SCHEDULE;
+    if (this.stopping || now >= S.until || existsSync(`${PATHS.data}/demo_schedule.off`)) return "off";
+    const d = new Date(now);
+    if (!S.hoursUtc.includes(d.getUTCHours()) || d.getUTCMinutes() < S.minute) return "idle";
+    const slot = d.toISOString().slice(0, 13);
+    const st = this.loadSched();
+    if (st.lastSlot === slot) return "done";
+    const runs = (st.runs ?? 0) + 1;
+    writeFileSync(this.schedFile(), JSON.stringify({ lastSlot: slot, runs }), { mode: 0o600 }); // first: a crash never repeats a slot
+    const demo = this.demoAccount.toLowerCase();
+    const u = this.store.all().find((x) => x.owner?.toLowerCase() === demo && hasKey(x));
+    if (!u) return "skip: no linked demo user";
+    const acct = await this.venue.account(u.owner!);
+    if (acct.positions.length) return `skip: the demo account holds ${acct.positions.map((p) => p.base).join(", ")}`;
+    if (acct.equity < S.minEquity) return `skip: equity ${acct.equity.toFixed(2)} below ${S.minEquity}`;
+    const base = S.markets[runs % S.markets.length]!;
+    const side: Side = runs % 2 === 0 ? "long" : "short";
+    if (!this.venue.market(base)) return `skip: no ${base} market`;
+    const tk = this.tk(u);
+    const p: OpenCmd = { kind: "open", side, base, margin: S.margin, leverage: S.leverage, tp: { pct: S.tpPct }, sl: { pct: S.slPct } };
+    const r = await this.posLock.run(`${tk.owner.toLowerCase()}:${base}`, () => this.openLocked(u, 0, side, p, tk, { via: "schedule", quiet: true }));
+    if (!r || r.filledBase === 0) return `skip: nothing filled on ${base}`;
+    setTimeout(() => void this.scheduledFlatten(u, base, side).catch((e) => log("scheduled flatten failed", base, String(e).slice(0, 160))), S.maxHoldMs).unref();
+    return `opened ${side} ${base} ${r.filledBase} (tx ${r.hash})`;
+  }
+
+  /** The scheduled position is still open after maxHoldMs (neither TP nor SL fired): close it at market, quietly. */
+  async scheduledFlatten(u: User, base: string, side: Side): Promise<void> {
+    if (u.owner?.toLowerCase() !== this.demoAccount.toLowerCase()) return;
+    const pos = (await this.venue.account(u.owner)).positions.find((x) => x.base === base);
+    if (!pos || pos.side !== side) return;
+    await this.doClose(u, 0, base, 1, `scheduled flatten after ${Math.round(DEMO_SCHEDULE.maxHoldMs / 60_000)} min`, { expectSide: side, auto: true });
+    log("demo schedule: flattened", base);
   }
 
   // ---------- /stops: dreamDEX's chain-held TP/SL, mirrored and checked ----------
@@ -999,7 +1048,7 @@ export class Bot {
       if (bad) { await this.say(chat, h(bad)); return; }
       r[kind] = v;
     }
-    r.side = pos.side; r.setAt = Date.now();
+    r.side = pos.side; r.setAt = Date.now(); delete r.quiet; // a level the user sets is always reported
     if (r.tp || r.sl) u.rules[base] = r; else delete u.rules[base];
     this.store.save();
     await this.protector.refreshUser(u).catch(() => {});
