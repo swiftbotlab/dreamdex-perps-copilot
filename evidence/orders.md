@@ -1,6 +1,6 @@
 # Orders placed by the bot on Somnia Tokyo testnet (Hideki, chain 50383)
 
-Generated 2026-10-29T06:11:30.514Z by scripts/evidence.ts from the bot's order log, every row re-read from the chain: 37/37 receipts are `success`, sent by the user's linked bot key and calling `placeOrderFor(account, ...)` on the market's perp pool. "via card" marks an order opened from a shared card (Copy this trade).
+Generated 2026-10-29T20:28:59.306Z by scripts/evidence.ts from the bot's order log, every row re-read from the chain: 39/39 receipts are `success`, sent by the user's linked bot key and calling `placeOrderFor(account, ...)` on the market's perp pool. "via card" marks an order opened from a shared card (Copy this trade).
 
 Accounts: `0x2a11e7388d1d2f9690f2636846d44b478f61bf08`, `0x0e7e8df6eac2e14165b4fa4cb2bd4e445d0e3817`. "trigger to close" (bot exits from 2026-10-29): time from the mark update that crossed the level to the confirmed close, from the bot's own clock.
 
@@ -43,3 +43,5 @@ Accounts: `0x2a11e7388d1d2f9690f2636846d44b478f61bf08`, `0x0e7e8df6eac2e14165b4f
 | 10-29 05:24:23 | open |  | HYPE-PERP | long | 0.12 | 79.37 | [0x1722a8ce06…](https://explorer.testnet.somnia.network/tokyo/tx/0x1722a8ce06557ccbf2afdb3f0ce39d9c886fb23b91d488ea8bb1db2325e3d030) | 35982688 | success |  | `0x2A11…bF08` |
 | 10-29 06:07:40 | open |  | HYPE-PERP | long | 0.12 | 79.31 | [0x83107465b1…](https://explorer.testnet.somnia.network/tokyo/tx/0x83107465b11200f9cb2969b70f416be5a38128e84c9bd47baa25b8280cdfbe48) | 36008646 | success |  | `0x2A11…bF08` |
 | 10-29 06:08:49 | close |  | HYPE-PERP | short | 0.12 | 79.26 | [0x5a5fe92063…](https://explorer.testnet.somnia.network/tokyo/tx/0x5a5fe92063759d721ecddee54b35c245de15fc96e4de45fab6aaff391a1c1903) | 36009333 | success |  | `0x2A11…bF08` |
+| 10-29 19:20:04 | open | schedule | XRP-PERP | short | 9.3 | 1.2813 | [0x57062feb35…](https://explorer.testnet.somnia.network/tokyo/tx/0x57062feb35fa61b708f3392bbc7c61f203665b3cd7060785b502421259e7cbe2) | 36483932 | success |  | `0x2A11…bF08` |
+| 10-29 19:32:47 | close (stop-loss) |  | XRP-PERP | long | 9.3 | 1.2872 | [0xb11999037a…](https://explorer.testnet.somnia.network/tokyo/tx/0xb11999037a1901e7e203179996412e51a7a471e667acb970426f834f5fc80bcc) | 36491557 | success | 2.9 s | `0x2A11…bF08` |

@@ -1,12 +1,12 @@
 {
- "generated": "2026-10-29T06:11:30.513Z",
+ "generated": "2026-10-29T20:28:59.306Z",
  "chainId": 50383,
  "accounts": [
   "0x2a11e7388d1d2f9690f2636846d44b478f61bf08",
   "0x0e7e8df6eac2e14165b4fa4cb2bd4e445d0e3817"
  ],
- "verified": 37,
- "total": 37,
+ "verified": 39,
+ "total": 39,
  "orders": [
   {
    "time": "2026-10-20T13:43:08Z",
@@ -747,6 +747,46 @@
    "gasUsed": 1594560,
    "triggerToCloseS": null,
    "triggerSource": null
+  },
+  {
+   "time": "2026-10-29T19:20:04Z",
+   "logged": "2026-10-29T19:20:04.804Z",
+   "kind": "open",
+   "reason": null,
+   "via": "schedule",
+   "market": "XRP-PERP",
+   "side": "short",
+   "filled": 9.3,
+   "avgPrice": 1.2813,
+   "hash": "0x57062feb35fa61b708f3392bbc7c61f203665b3cd7060785b502421259e7cbe2",
+   "block": 36483932,
+   "status": "success",
+   "verified": true,
+   "from": "0xdd5ddd125d6a9b3d4641e5bdb5456e5ec098fb18",
+   "account": "0x2A11e7388D1D2F9690f2636846d44b478f61bF08",
+   "gasUsed": 1775858,
+   "triggerToCloseS": null,
+   "triggerSource": null
+  },
+  {
+   "time": "2026-10-29T19:32:47Z",
+   "logged": "2026-10-29T19:32:47.487Z",
+   "kind": "close",
+   "reason": "stop-loss 1.2851 reached (mark 1.2852)",
+   "via": null,
+   "market": "XRP-PERP",
+   "side": "long",
+   "filled": 9.3,
+   "avgPrice": 1.2872,
+   "hash": "0xb11999037a1901e7e203179996412e51a7a471e667acb970426f834f5fc80bcc",
+   "block": 36491557,
+   "status": "success",
+   "verified": true,
+   "from": "0xdd5ddd125d6a9b3d4641e5bdb5456e5ec098fb18",
+   "account": "0x2A11e7388D1D2F9690f2636846d44b478f61bF08",
+   "gasUsed": 652171,
+   "triggerToCloseS": 2.913,
+   "triggerSource": "push"
   }
  ]
 }
