@@ -24,6 +24,12 @@ export const DEMO_SCHEDULE = {
   margin: 2.4, leverage: 5, tpPct: 0.3, slPct: 0.3, maxHoldMs: 45 * 60_000, minEquity: 2.8,
   markets: ["XRP", "SOL", "ETH"], tickMs: 60_000,
 };
+/**
+ * ExitGuard (chain/src/ExitGuard.sol), deployed 2026-10-29: the implementation an account can point its code at with
+ * EIP-7702 so that Somnia Reactivity fires its stop-loss with no bot. The bot only READS it (/stops, /positions), and
+ * only for accounts whose code is exactly the designator for this address.
+ */
+export const EXITGUARD_IMPL = "0xd40f8e482bbc195e383571ddafe0a1bddbc703d9" as const;
 /** Earlier demo accounts whose bot orders still count in /demo's history (Oct 20-26: 0x0e7E…3817). */
 export const DEMO_HISTORY = ["0x0e7E8DF6Eac2E14165b4fA4CB2BD4e445d0E3817"] as const;
 

@@ -18,15 +18,16 @@ Live on Somnia Tokyo testnet: [@SwiftPerpsBot](https://t.me/SwiftPerpsBot). Buil
 Then `/start`, Link a bot in the app, and `/long ETH 20 5x tp 4% sl 2%`.
 
 <!-- evidence:headline -->
-**Evidence.** 34 real orders sent by the bot, 34 verified `success` on chain, 9 of them exits the bot fired by itself, on 3 days (newest 2026-10-29 02:14 UTC); scheduled demo trades keep adding three a day until Nov 1. Latest measured time from the pushed mark crossing a TP/SL level to the confirmed close: 2.5 s.
+**Evidence.** 37 real orders sent by the bot, 37 verified `success` on chain, 9 of them exits the bot fired by itself, on 3 days (newest 2026-10-29 06:08 UTC); scheduled demo trades keep adding three a day until Nov 1. Latest measured time from the pushed mark crossing a TP/SL level to the confirmed close: 2.5 s.
 <!-- /evidence:headline -->
 - Evidence page (every order re-read from its receipt, the chain-held stop check run step by step): **https://swiftbotlab.github.io/dreamdex-perps-copilot/**
+- **Chain-fired stop-loss, live:** with the bot process stopped, Somnia Reactivity woke our ExitGuard contract on the demo account (an EIP-7702 account) and it closed the bot-opened HYPE long by itself. [How and the tx hashes](#chain-fired-stop-loss-exitguard).
 - Order table: [evidence/orders.md](evidence/orders.md) · [CSV](evidence/orders.csv) · [JSON](evidence/orders.json)
 - Demo video (112 s, YouTube): https://youtu.be/rWLEHY_x_j4 (recorded 2026-10-20: orders, a bot-fired stop-loss, a liquidation alert, `/card`; also as [demo.mp4 on the v1.0.0 release](https://github.com/swiftbotlab/dreamdex-perps-copilot/releases/download/v1.0.0/demo.mp4))
 
 | Judging criterion | Where to look |
 |---|---|
-| MVP potential: user value, scope, repeat-use loop, execution | [Two layers of protection](#two-layers-of-protection), [Loops](#loops), [Reliability](#reliability), [Architecture](#architecture), 136 tests |
+| MVP potential: user value, scope, repeat-use loop, execution | [Two layers of protection](#two-layers-of-protection), [Chain-fired stop-loss](#chain-fired-stop-loss-exitguard), [Loops](#loops), [Reliability](#reliability), [Architecture](#architecture), 141 bot tests + 26 contract tests (+2 fork tests) |
 | Evidence of building: live orders, tx hashes, repo, demo | [Evidence page](https://swiftbotlab.github.io/dreamdex-perps-copilot/), [Evidence](#evidence-real-orders-on-somnia-tokyo-testnet), the video |
 | Communication: X posts | [X posts](#x-posts) |
 
@@ -36,8 +37,29 @@ A stop is only as alive as whatever holds it. dreamDEX already holds TP/SL on ch
 
 1. **Chain-held (dreamDEX's own TP/SL).** `/stops` reads every pending stop from its registry and checks it: resting orders on the closing side that cut a stop to part of the position or to nothing (the registry sizes a fired stop to the pool's reducing capacity, and a stop below the minimum size is dropped), a size fixed at arming that no longer covers a grown position, a stop on the wrong side or with no position left, a linked pair whose partial fill cancels the other leg. Linked users get the warning unprompted within a minute, and a note when a chain-held stop fired, was dropped or was cancelled by its partner. `/positions` shows both layers side by side.
 2. **Bot-side (fast second layer).** `/tp`, `/sl` and `/guard`: the bot follows every market you hold through Somnia Reactivity (`somnia_watch` with `tryGetMarkPrice()` evaluated at the pushed block) and closes the position when a level is reached. A take-profit exits with an order capped at the TP price, so it never fills worse than the level. This layer runs while the bot runs; the chain-held layer does not need it.
+3. **Chain-fired, our own (new, 2026-10-29).** ExitGuard: an EIP-7702 account that Somnia Reactivity wakes every 5 s and that closes its own position at the stop, with no bot running. Live on the demo account; see [Chain-fired stop-loss](#chain-fired-stop-loss-exitguard).
 
 Live run on 2026-10-29 (account `0x2A11…bF08`, every step on the [evidence page](https://swiftbotlab.github.io/dreamdex-perps-copilot/)): a linked TP/SL bracket was armed on an XRP-PERP long, `/stops` showed both legs OK; then a post-only sell of 7 XRP was rested 20 % above the market, and 5 s later `/stops` said *"will close NOTHING when it fires. Your resting sell orders on XRP-PERP (7 XRP) use up the position's closing capacity, so the stop is dropped (ReduceOnlyBelowMinQty)"*. The same warning arrived unprompted 56 s after the order. Cancelling the order restored both legs.
+
+## Chain-fired stop-loss (ExitGuard)
+
+The third layer, and the one the chain runs end to end. [`chain/src/ExitGuard.sol`](chain/src/ExitGuard.sol) is our own small contract that an account points its code at with one EIP-7702 transaction. The account arms a stop on itself; Somnia Reactivity then wakes the account every 5 s (a one-shot `Schedule` it renews on every wake) and at every epoch. When the pool's mark crosses the level, the account closes its own position with one immediate-or-cancel order in that same reactive transaction: no bot, no keeper, nobody signs. **What is chain-held now:** the stop on the bot's demo account `0x2A11…bF08` (its owner key armed it; a linked bot key cannot, so other users would arm it from their own wallet), one market at a time. The code can only reduce the account's own position, sized from the position read in the same transaction, filling at most the slippage set at arming (1 % here) from the mark; it makes no approvals, transfers or other calls ([threat model](SECURITY.md#chain-fired-stop-exitguard-eip-7702--somnia-reactivity); 26 unit tests including a fuzz test, and 2 tests on a fork of the live HYPE-PERP pool that passed on earlier versions but are flaky on Somnia's RPC). **Limits and costs, measured:** each wake costs the account about 0.0026 STT (the check, booking the next wake and removing the used one), so ~1.8 STT an hour at 5 s; the account must hold 32 STT to book wake-ups (the precompile's minimum, not spent; below it the epoch heartbeat still checks every ~5 minutes); one-off costs were ~33M gas to deploy (~0.2 STT), 1.19M gas to delegate and 0.6-1.4M to arm. The bot-side exits stay as the fallback, set wider (here -1.5 % against the chain-fired -0.06 %), and `/stops` shows "Chain-fired stop armed" with how many times the chain has checked it. The run below used a level 0.06 % under the mark so it would fire within minutes.
+
+**What it took (two designs retired on the way, both on chain in [evidence/exitguard_ops.jsonl](evidence/exitguard_ops.jsonl)):** v1 woke on every new order on the HYPE-PERP book; market makers re-quote ladders of ~9 orders per block, so it was called 363 times in 30 s and would have cost up to ~36 STT an hour. v2 moved to a schedule but renewed only when the wake-up's topic 1 equalled the booked time, and the precompile passes the time it fired (booked time rounded up to the block), so it never renewed. v3 compares with `>=` and removes each used one-shot, which on Somnia stays listed until it is removed.
+
+<!-- evidence:chainstop -->
+| UTC (2026-10-29) | step | tx |
+|---|---|---|
+| 05:24:23 | `/long HYPE 2 5x sl 1.5%` in Telegram: the bot opens 0.12 HYPE through its linked key | [`0x1722a8ce…`](https://explorer.testnet.somnia.network/tokyo/tx/0x1722a8ce06557ccbf2afdb3f0ce39d9c886fb23b91d488ea8bb1db2325e3d030) |
+| 06:00:18 | ExitGuard deployed (9967 bytes, 33,228,665 gas) | [`0x7d848f1a…`](https://explorer.testnet.somnia.network/tokyo/tx/0x7d848f1a1b604bd30ea15ae0fd062efd62b4e964f67b618d425716aee7ec5605) |
+| 06:00:31 | EIP-7702 type-4 tx: the demo account's code becomes `0xef0100` + ExitGuard (1,191,067 gas) | [`0x39b25d4f…`](https://explorer.testnet.somnia.network/tokyo/tx/0x39b25d4f99f5468f23bc1abca966c5ce026e54ec8ddc5f8e978e5c8cc1e56045) |
+| 06:01:23 | Armed on the account: SL 79.21 (mark 79.264), at most 1.00 % slippage; Reactivity subscriptions 23451436 (a wake-up every 5 s, renewed on each wake) and 23451437 (every epoch) (606,733 gas) | [`0x28b80fdf…`](https://explorer.testnet.somnia.network/tokyo/tx/0x28b80fdf62b770332a0314a9cf0a592aa4f6ce8e444c33dbcbbb9d9e0c44ff78) |
+| 06:02:21 | `systemctl --user stop ddmvp`: bot process stopped | - |
+| 06:04:03 | **stop-loss fired by the chain** after 33 checks: mark 79.2078 <= 79.21, whole position sold at 79.19 in the same transaction, both subscriptions removed. Reactive tx: from = to = the account, nonce `604088341364736` = block 36006471, queue position 0, signature r = s = 0x1 (1,706,154 gas) | [`0x2be38f67…`](https://explorer.testnet.somnia.network/tokyo/tx/0x2be38f67d9ceafae7168c7ee1db6fd25b2075c25b7f5245dcf2df9074f72ec89) |
+| 06:04:50 | `systemctl --user restart ddmvp`: bot back, position already closed | - |
+
+Armed to fired 160 s, bot stopped to fired 102 s. Nonces across the window: demo account 51 → 51, bot key 35 → 35 (neither sent anything). From arming to the fire the account paid 0.094 STT: 33 wake-ups at ~0.00251 STT each and 0.0136 STT for the close.
+<!-- /evidence:chainstop -->
 
 ## What it does
 
@@ -118,14 +140,17 @@ All orders were placed **by the bot**, through a bot key linked to the account w
 Accounts: from 2026-10-29 the demo account is `0x2A11e7388D1D2F9690f2636846d44b478f61bF08`, an account outside the Perps Arena holding testnet USDso bought with faucet STT. The orders of 2026-10-20 and 2026-10-26 went to the earlier demo account `0x0e7E8DF6Eac2E14165b4fA4CB2BD4e445d0E3817` (paper USDso from its own airdrop); `/demo` counts both.
 
 <!-- evidence:summary -->
-34 orders (17 opens, 17 closes), 34/34 verified `success`: 24 on 2026-10-20, 4 on 2026-10-26, 6 on 2026-10-29. 9 closes were fired by the bot itself (take-profit, stop-loss or guard). All of them are on our own demo accounts; the bot has had no outside users yet. Generated 2026-10-29 02:15 UTC.
+37 orders (19 opens, 18 closes), 37/37 verified `success`: 24 on 2026-10-20, 4 on 2026-10-26, 9 on 2026-10-29. 9 closes were fired by the bot itself (take-profit, stop-loss or guard). All of them are on our own demo accounts; the bot has had no outside users yet. Generated 2026-10-29 06:11 UTC.
 <!-- /evidence:summary -->
 
 <!-- evidence:latest -->
-Newest 10 (all 34 in [evidence/orders.md](evidence/orders.md)):
+Newest 10 (all 37 in [evidence/orders.md](evidence/orders.md)):
 
 | UTC | action | market | filled | avg price | tx | status | trigger to close |
 |---|---|---|---|---|---|---|---|
+| 10-29 06:08 | close | HYPE-PERP short | 0.12 | 79.26 | [`0x5a5fe920…`](https://explorer.testnet.somnia.network/tokyo/tx/0x5a5fe92063759d721ecddee54b35c245de15fc96e4de45fab6aaff391a1c1903) | success |  |
+| 10-29 06:07 | open | HYPE-PERP long | 0.12 | 79.31 | [`0x83107465…`](https://explorer.testnet.somnia.network/tokyo/tx/0x83107465b11200f9cb2969b70f416be5a38128e84c9bd47baa25b8280cdfbe48) | success |  |
+| 10-29 05:24 | open | HYPE-PERP long | 0.12 | 79.37 | [`0x1722a8ce…`](https://explorer.testnet.somnia.network/tokyo/tx/0x1722a8ce06557ccbf2afdb3f0ce39d9c886fb23b91d488ea8bb1db2325e3d030) | success |  |
 | 10-29 02:14 | close, stop-loss (bot) | ETH-PERP short | 0.0052 | 2301.86 | [`0xa148b523…`](https://explorer.testnet.somnia.network/tokyo/tx/0xa148b523b3cec41ad18b38e038fcad96018607f1dd3e93c59c6f8b1cf3a51d62) | success | 2.5 s |
 | 10-29 02:08 | open | ETH-PERP long | 0.0052 | 2307.05 | [`0x19550901…`](https://explorer.testnet.somnia.network/tokyo/tx/0x195509016abd538ef75a14878fadf0bb17c1d71bead1439d29937262927aaba7) | success |  |
 | 10-29 01:16 | close | XRP-PERP short | 9.1 | 1.3173 | [`0x2e6d136d…`](https://explorer.testnet.somnia.network/tokyo/tx/0x2e6d136d76c96a6ee7e79d711d0fb7cfab8c8cea9b8dc3c764c1a3ffae275c79) | success |  |
@@ -133,9 +158,6 @@ Newest 10 (all 34 in [evidence/orders.md](evidence/orders.md)):
 | 10-29 01:03 | close, stop-loss (bot) | XRP-PERP short | 9 | 1.3168 | [`0x4c443a40…`](https://explorer.testnet.somnia.network/tokyo/tx/0x4c443a40c1bf3cecb975e6a2bc6c29ee57238f36f7a1af87da46d3ef586f91b8) | success | 3.4 s |
 | 10-29 00:53 | open | XRP-PERP long | 9 | 1.3209 | [`0x94302cd2…`](https://explorer.testnet.somnia.network/tokyo/tx/0x94302cd24d488b972634c6e3a98fc84f5da6c6fab4be4c3b22a93cc53a7bb775) | success |  |
 | 10-26 02:18 | close, stop-loss (bot) | SOL-PERP short | 0.49 | 101.08 | [`0xae8c3ae7…`](https://explorer.testnet.somnia.network/tokyo/tx/0xae8c3ae7369b11bf307cc046a882f4071efae94fc0763fa987e454e0c31e0867) | success |  |
-| 10-26 02:18 | open | SOL-PERP long | 0.49 | 101.14 | [`0xd08da31b…`](https://explorer.testnet.somnia.network/tokyo/tx/0xd08da31b0a328b6e9eb84817a99ef74b1e8431471737e3835d91b5dac403dee5) | success |  |
-| 10-26 02:18 | close | ETH-PERP short | 0.0432 | 2311.33 | [`0x74ff2f03…`](https://explorer.testnet.somnia.network/tokyo/tx/0x74ff2f03338caa120fddfc49cf11425ea589d7ff5d1f08dd28cf565d7d012969) | success |  |
-| 10-26 02:14 | open, card copy | ETH-PERP long | 0.0432 | 2309.53 | [`0x887ca266…`](https://explorer.testnet.somnia.network/tokyo/tx/0x887ca26690b163b68f7b9066c41a015152c05aab9646c91acd28cc5b97b0dbd7) | success |  |
 <!-- /evidence:latest -->
 
 ### Card copy evidence (live, 2026-10-26)
@@ -163,6 +185,8 @@ These four orders are also the first live run of the hardened send path (signed 
 - **A stop is worth what the pool lets it close:** read `PerpPool.getReducingCapacity(owner)` before trusting a TP/SL; resting orders on the closing side shrink it, and a fired stop below the pool minimum places nothing.
 - **viem WebSockets can die quietly:** after 5 failed reconnects the dead socket stays cached by URL, so a new client for the same URL gets it back. Probe it and close the cached socket (or restart) instead.
 - **Know how far the indexer is behind:** `getIndexerFreshness` gives the lag (we saw 151 s); for state you act on, read the registry or pool, or the contract's own logs.
+- **On-chain Reactivity is paid per matched log:** a handler subscribed to a busy book's `OrderPlaced` was called ~9 times per block (363 calls in 30 s). For a stop, a self-renewing `Schedule` every few seconds is cheaper and predictable (~0.0026 STT per wake here).
+- **`Schedule` wake-ups carry the time they fired, not the time you booked** (topic 1 = booked time rounded up to the block, in ms), and a fired one-shot stayed listed in `somnia_reactivityGetSubscriptions` until we unsubscribed it (~27k gas).
 - **Never resend blind:** sign locally, know the hash before posting, label failures by the step that failed, and block new orders on that account and market until the chain says the old one is mined or gone.
 
 ## Mainnet plan
@@ -187,8 +211,9 @@ Requirements: Node 22, a Telegram bot token, Linux with `bwrap` for the jail (op
 ```bash
 git clone https://github.com/swiftbotlab/dreamdex-perps-copilot && cd dreamdex-perps-copilot
 npm ci --ignore-scripts
-npm test                      # 136 tests: parsing, key vault, card, protection, close races, send outcomes, card copies, /watch, /demo, /stops, watchdog, schedule, /try
+npm test                      # 141 tests: parsing, key vault, card, protection, close races, send outcomes, card copies, /watch, /demo, /stops, watchdog, schedule, /try
 npm run build                 # bundles dist/bot.mjs + dist/resvg.wasm
+(cd chain && forge test)      # ExitGuard: 26 tests; fork tests on the live pool: see chain/test/ExitGuardFork.t.sol
 
 # secrets live outside the repo, one KEY=VALUE per line, chmod 600
 printf 'BOT_TOKEN=123:abc\n' > ~/secrets/ddmvp_bot.env
@@ -219,6 +244,8 @@ Telegram  <-- long polling (Bot API over fetch) -->  src/bot.ts   commands, butt
                                                    src/card.ts     SVG -> PNG with resvg (WebAssembly)
                                                    src/locks.ts    per account+market and per bot key locks
                                                    src/instance.ts single-instance heartbeat lock
+                                                   src/exitguard.ts reads an account's chain-fired stop (EIP-7702 + ExitGuard)
+ chain/src/ExitGuard.sol  the chain-fired stop: Reactivity wakes the account every 5 s, the account closes its own position
 ```
 
 - Testnet only: the bot asserts chain id 50383 at startup and refuses anything else.
@@ -231,6 +258,7 @@ Telegram  <-- long polling (Bot API over fetch) -->  src/bot.ts   commands, butt
 
 - `/follow` copy mode: designed, not shipped. Each copied position must first be tracked from chain events.
 - Arm and cancel chain-held TP/SL from the chat for accounts whose own key the user controls (a linked bot key cannot arm them; the account must).
+- ExitGuard for any user: their own wallet signs the EIP-7702 authorization and the `arm` call (a one-page flow), several markets per account, and a Telegram note when the chain fired it. The bot keeps only reading it.
 - Resting limit orders, group mode for trading clubs, and mainnet (plan above).
 
 ## Disclaimer

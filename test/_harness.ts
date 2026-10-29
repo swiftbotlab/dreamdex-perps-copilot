@@ -57,6 +57,7 @@ export function makeBot(opts: { mark?: number; maxLev?: Record<string, number> }
     cap: undefined as undefined | { position: number; pendingBid: number; pendingAsk: number; effective: number },
     stopRows: [] as unknown[],
     lag: 2 as number | undefined,
+    guard: { delegated: false } as Record<string, unknown>,
   };
   const maxLev = opts.maxLev ?? { ETH: 20, SOL: 20, BTC: 20 };
   const market = (b: string) => (POOLS[b] ? { display: `${b}-PERP`, symbol: `${b}/USDso:USDso`, info: { poolAddress: POOLS[b] } } : undefined);
@@ -82,6 +83,7 @@ export function makeBot(opts: { mark?: number; maxLev?: Record<string, number> }
     nativeStops: async () => state.stops,
     recentStopIds: async () => new Map(),
     indexerLagS: async () => state.lag,
+    guard: async () => state.guard,
     reducingCapacity: async () => { if (!state.cap) throw new Error("no capacity"); return state.cap; },
     minQty: () => 0.001,
     exchange: { client: { listPerpStopOrders: async () => state.stopRows } },

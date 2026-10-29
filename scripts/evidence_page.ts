@@ -28,6 +28,56 @@ for (const s of demo.steps) {
   if (rc.status !== "success") throw new Error(`demo step tx ${s.tx} is ${rc.status}`);
 }
 
+// The chain-fired stop run (scripts/exitguard_evidence.ts wrote it from the chain); every tx is re-checked here too.
+interface ChainStop {
+  title: string; account: string; implementation: { address: string; deployTx: string; gasUsed: number; codeBytes: number; time: string };
+  delegation: { tx: string; time: string; gasUsed: number; authorization: { address: string; chainId: number; nonce: number } };
+  open: { tx: string; time: string }; arm: { tx: string; time: string; gasUsed: number; sl: number; markAtArm: number; slippageBps: number; maxChecks: number; expiresAt: string; intervalMs: number; scheduleSubscription: string; heartbeatSubscription: string; pool: string };
+  botStopped: string; botStarted: string;
+  fire: { tx: string; block: number; time: string; gasUsed: number; effectiveGasPriceGwei: number; from: string; type: string; nonce: string; nonceBlock: number; nonceQueueIndex: number; signature: { r: string; s: string }; kind: string; mark: number; trigger: number; checks: number; poolOrderFilledLogs: number; avgFillPrice: number | null; ended: { reason: string } | null };
+  timings: { armToFireS: number; botStoppedToFireS: number; fireToBotStartS: number };
+  noncesBefore: Record<string, number>; noncesAfter: Record<string, number>; costs?: { sttSpentArmToFire: number; closeStt: number; perWakeStt: number | null };
+}
+const cs = (() => { try { return JSON.parse(readFileSync("evidence/chain_fired_stop.json", "utf8")) as ChainStop; } catch { return undefined; } })();
+if (cs) for (const h of [cs.implementation.deployTx, cs.delegation.tx, cs.open.tx, cs.arm.tx, cs.fire.tx]) {
+  const rc = await pc.getTransactionReceipt({ hash: h as `0x${string}` });
+  if (rc.status !== "success") throw new Error(`chain-fired stop tx ${h} is ${rc.status}`);
+}
+const t8 = (iso: string) => esc(iso.slice(11, 19));
+// The bot's own /stops and /positions replies about it (copied as sent); their txs are re-checked too.
+const csBot = (() => { try { return JSON.parse(readFileSync("evidence/chain_fired_stop_bot.json", "utf8")) as { note: string; quotes: { t: string; cmd: string; after: string; text: string }[]; txs: Record<string, string> }; } catch { return undefined; } })();
+if (csBot) for (const h of Object.values(csBot.txs)) {
+  const rc = await pc.getTransactionReceipt({ hash: h as `0x${string}` });
+  if (rc.status !== "success") throw new Error(`chain-fired stop capture tx ${h} is ${rc.status}`);
+}
+const csQuotes = !csBot ? "" : `<p class="mut">What the bot shows (its Telegram replies, copied as sent). ${esc(csBot.note)} Txs: open ${tx(csBot.txs.open!)}, arm ${tx(csBot.txs.arm!)}, disarm ${tx(csBot.txs.disarm!)}, close ${tx(csBot.txs.close!)}.</p>
+${csBot.quotes.map((q) => `<div class="st"><span class="t">${t8(q.t)}</span><span class="who b">bot</span><code>${esc(q.cmd)}</code>${q.after ? ` <span>after ${esc(q.after)}</span>` : ""}</div><blockquote>${esc(q.text).replace(/\n/g, "<br>")}</blockquote>`).join("\n")}`;
+const csHtml = !cs ? "" : `
+<h2>${esc(cs.title)}</h2>
+<p>The demo account ${ad(cs.account)} points its code at <a href="${EXPLORER_ADDR}${esc(cs.implementation.address)}">ExitGuard</a> (our ${cs.implementation.codeBytes}-byte contract, <a href="${REPO}/blob/main/chain/src/ExitGuard.sol">source</a>) with one EIP-7702 transaction, and arms a stop on itself. From then on Somnia Reactivity wakes the account every 5 s (a one-shot Schedule it renews on every wake) and every epoch; when the mark crosses the level, the account closes its own position. Nobody signs that close: it is a reactive transaction the validators add to the block. This run was made with the Telegram bot <b>stopped</b>.</p>
+<ol class="steps">
+<li><div class="st"><span class="t">${t8(cs.open.time)}</span><span class="who b">bot</span></div><div><code>/long HYPE 2 5x sl 1.5%</code> in Telegram: the bot opened 0.12 HYPE long through its linked key, as for any user (the bot-side SL at -1.5 % stays as a fallback) · ${tx(cs.open.tx)}</div></li>
+<li><div class="st"><span class="t">${t8(cs.implementation.time)}</span><span class="who o">account owner</span></div><div>Deployed ExitGuard (${cs.implementation.gasUsed.toLocaleString("en-US")} gas) · ${tx(cs.implementation.deployTx)}</div></li>
+<li><div class="st"><span class="t">${t8(cs.delegation.time)}</span><span class="who o">account owner</span></div><div>EIP-7702 (type-4) transaction: the account's code is now <code>0xef0100</code> + ExitGuard (authorization for chain ${cs.delegation.authorization.chainId}) · ${tx(cs.delegation.tx)}</div></li>
+<li><div class="st"><span class="t">${t8(cs.arm.time)}</span><span class="who o">account owner</span></div><div>Armed the chain-fired stop: SL ${esc(cs.arm.sl)} (mark ${esc(cs.arm.markAtArm.toFixed(3))}), fills at most ${(cs.arm.slippageBps / 100).toFixed(2)} % from the mark, at most ${cs.arm.maxChecks.toLocaleString("en-US")} checks, expires ${esc(cs.arm.expiresAt.slice(11, 16))} UTC. Reactivity subscriptions owned by the account: <code>${esc(cs.arm.scheduleSubscription)}</code> (a wake-up in ${cs.arm.intervalMs / 1000} s, renewed on every wake) and <code>${esc(cs.arm.heartbeatSubscription)}</code> (every epoch) · ${tx(cs.arm.tx)}</div></li>
+<li><div class="st"><span class="t">${t8(cs.botStopped)}</span><span class="who o">operator</span></div><div><code>systemctl --user stop ddmvp</code>: the bot process is stopped (systemd journal: "Stopped ddmvp.service")</div></li>
+<li><div class="st"><span class="t">${t8(cs.fire.time)}</span><span class="who b">chain</span></div><div><b>${esc(cs.fire.kind)} fired by the chain</b> after ${cs.fire.checks.toLocaleString("en-US")} checks: mark ${esc(Number(cs.fire.mark.toFixed(4)))} at or below ${esc(cs.fire.trigger)}; the account sold its whole position in the same transaction (${cs.fire.poolOrderFilledLogs} fill${cs.fire.poolOrderFilledLogs === 1 ? "" : "s"}${cs.fire.avgFillPrice !== null ? ` at ${esc(cs.fire.avgFillPrice)}` : ""}), then removed both subscriptions${cs.fire.ended ? ` (${esc(cs.fire.ended.reason)})` : ""} · ${tx(cs.fire.tx)}</div></li>
+<li><div class="st"><span class="t">${t8(cs.botStarted)}</span><span class="who o">operator</span></div><div><code>systemctl --user restart ddmvp</code>: the bot is back; it finds the position already closed</div></li>
+</ol>
+<div class="scroll"><table class="facts">
+<thead><tr><th>check</th><th>what the chain shows</th></tr></thead>
+<tbody>
+<tr><td>Who sent the close</td><td>from ${ad(cs.fire.from)} (the subscription owner) to itself, input <code>onEvent(...)</code>, type ${esc(cs.fire.type)}, signature r = ${esc(cs.fire.signature.r)}, s = ${esc(cs.fire.signature.s)} (a placeholder: nobody signed it)</td></tr>
+<tr><td>Reactive nonce</td><td><code>${esc(cs.fire.nonce)}</code> = block ${cs.fire.nonceBlock} &lt;&lt; 24 | queue position ${cs.fire.nonceQueueIndex}: a validator-made reactive transaction, not one of the account's own nonces</td></tr>
+<tr><td>Account and bot key nonces</td><td>demo account ${esc(cs.noncesBefore.account)} → ${esc(cs.noncesAfter.account)}, bot key ${esc(cs.noncesBefore.botKey)} → ${esc(cs.noncesAfter.botKey)} across the window: neither key sent anything</td></tr>
+<tr><td>Timings</td><td>armed → fired ${cs.timings.armToFireS} s · bot stopped → fired ${cs.timings.botStoppedToFireS} s · fired → bot back ${cs.timings.fireToBotStartS} s</td></tr>
+<tr><td>Gas</td><td>delegation ${cs.delegation.gasUsed.toLocaleString("en-US")} · arm ${cs.arm.gasUsed.toLocaleString("en-US")} · the close ${cs.fire.gasUsed.toLocaleString("en-US")} at ${esc(cs.fire.effectiveGasPriceGwei)} gwei${cs.costs ? ` · the account paid ${esc(cs.costs.sttSpentArmToFire)} STT from arming to the fire (${cs.fire.checks} wake-ups at ~${esc(cs.costs.perWakeStt)} STT each, and ${esc(cs.costs.closeStt)} STT for the close)` : ""}</td></tr>
+</tbody></table></div>
+${csQuotes}
+<p class="mut">This is ExitGuard version 3. Version 1 woke on every new order on the book and would have cost up to ~36 STT an hour on a busy book; version 2 never renewed its schedule. Both are retired; their transactions are in <a href="${REPO}/blob/main/evidence/exitguard_ops.jsonl">evidence/exitguard_ops.jsonl</a> and what each taught us is in the README.</p>
+<p class="mut">Limits: one stop per account (one market) at a time; a check every 5 s, each paid by the account (about 0.0026 STT, ~1.8 STT an hour), and the account must keep 32 STT to renew its wake-up (below that the epoch heartbeat still checks every ~5 minutes); the level here was set 0.06 % under the mark so it would fire within minutes for this run. Testnet only.</p>
+`;
+
 const orders = [...ev.orders].sort((a, b) => (a.time < b.time ? 1 : -1));
 const autoExits = ev.orders.filter((o) => o.kind === "close" && /^(take-profit|stop-loss|liquidation guard)/.test(o.reason ?? ""));
 const measured = ev.orders.filter((o) => o.triggerToCloseS !== null).map((o) => o.triggerToCloseS!) ;
@@ -83,6 +133,7 @@ table { border-collapse:collapse; width:100%; font-size:.86rem; min-width: 860px
 th, td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--line); white-space:nowrap; }
 th { color:var(--mut); font-weight:600; position:sticky; top:0; background:var(--card); }
 td.n { text-align:right; font-variant-numeric: tabular-nums; }
+table.facts { min-width: 0; } table.facts td, table.facts th { white-space: normal; vertical-align: top; } table.facts td:first-child { white-space: nowrap; }
 .ok { color:var(--ok); } .bad { color:var(--bad); }
 footer { margin-top:40px; color:var(--mut); font-size:.85rem; }
 </style>
@@ -109,6 +160,7 @@ footer { margin-top:40px; color:var(--mut); font-size:.85rem; }
 <li><code>/start</code>, Link a bot in the dreamDEX app, then <code>/long ETH 20 5x tp 4% sl 2%</code>.</li>
 </ol>
 
+${csHtml}
 <h2>${esc(demo.title)}</h2>
 <p class="mut">Account ${ad(demo.account)}. ${esc(demo.note)}</p>
 <ol class="steps">
@@ -142,10 +194,25 @@ const blocks: Record<string, string> = {
   summary: `${ev.total} orders (${opens} opens, ${closes} closes), ${ev.verified}/${ev.total} verified \`success\`: ${perDay}. ${autoExits.length} closes were fired by the bot itself (take-profit, stop-loss or guard). All of them are on our own demo accounts; the bot has had no outside users yet. Generated ${ev.generated.slice(0, 16).replace("T", " ")} UTC.`,
   latest: `Newest ${Math.min(10, orders.length)} (all ${ev.total} in [evidence/orders.md](evidence/orders.md)):\n\n| UTC | action | market | filled | avg price | tx | status | trigger to close |\n|---|---|---|---|---|---|---|---|\n${orders.slice(0, 10).map(md).join("\n")}`,
 };
+if (cs) {
+  const l = (h: string) => `[\`${h.slice(0, 10)}…\`](${EXPLORER_TX}${h})`;
+  blocks.chainstop = [
+    `| UTC (${cs.fire.time.slice(0, 10)}) | step | tx |`, "|---|---|---|",
+    `| ${cs.open.time.slice(11, 19)} | \`/long HYPE 2 5x sl 1.5%\` in Telegram: the bot opens 0.12 HYPE through its linked key | ${l(cs.open.tx)} |`,
+    `| ${cs.implementation.time.slice(11, 19)} | ExitGuard deployed (${cs.implementation.codeBytes} bytes, ${cs.implementation.gasUsed.toLocaleString("en-US")} gas) | ${l(cs.implementation.deployTx)} |`,
+    `| ${cs.delegation.time.slice(11, 19)} | EIP-7702 type-4 tx: the demo account's code becomes \`0xef0100\` + ExitGuard (${cs.delegation.gasUsed.toLocaleString("en-US")} gas) | ${l(cs.delegation.tx)} |`,
+    `| ${cs.arm.time.slice(11, 19)} | Armed on the account: SL ${cs.arm.sl} (mark ${cs.arm.markAtArm.toFixed(3)}), at most ${(cs.arm.slippageBps / 100).toFixed(2)} % slippage; Reactivity subscriptions ${cs.arm.scheduleSubscription} (a wake-up every ${cs.arm.intervalMs / 1000} s, renewed on each wake) and ${cs.arm.heartbeatSubscription} (every epoch) (${cs.arm.gasUsed.toLocaleString("en-US")} gas) | ${l(cs.arm.tx)} |`,
+    `| ${cs.botStopped.slice(11, 19)} | \`systemctl --user stop ddmvp\`: bot process stopped | - |`,
+    `| ${cs.fire.time.slice(11, 19)} | **${cs.fire.kind} fired by the chain** after ${cs.fire.checks.toLocaleString("en-US")} checks: mark ${Number(cs.fire.mark.toFixed(4))} <= ${cs.fire.trigger}, whole position sold${cs.fire.avgFillPrice !== null ? ` at ${cs.fire.avgFillPrice}` : ""} in the same transaction, both subscriptions removed. Reactive tx: from = to = the account, nonce \`${cs.fire.nonce}\` = block ${cs.fire.nonceBlock}, queue position ${cs.fire.nonceQueueIndex}, signature r = s = 0x1 (${cs.fire.gasUsed.toLocaleString("en-US")} gas) | ${l(cs.fire.tx)} |`,
+    `| ${cs.botStarted.slice(11, 19)} | \`systemctl --user restart ddmvp\`: bot back, position already closed | - |`,
+    "",
+    `Armed to fired ${cs.timings.armToFireS} s, bot stopped to fired ${cs.timings.botStoppedToFireS} s. Nonces across the window: demo account ${cs.noncesBefore.account} → ${cs.noncesAfter.account}, bot key ${cs.noncesBefore.botKey} → ${cs.noncesAfter.botKey} (neither sent anything).${cs.costs ? ` From arming to the fire the account paid ${cs.costs.sttSpentArmToFire} STT: ${cs.fire.checks} wake-ups at ~${cs.costs.perWakeStt} STT each and ${cs.costs.closeStt} STT for the close.` : ""}`,
+  ].join("\n");
+}
 let readme = readFileSync("README.md", "utf8");
 for (const [k, v] of Object.entries(blocks)) {
   const re = new RegExp(`(<!-- evidence:${k} -->)[\\s\\S]*?(<!-- /evidence:${k} -->)`);
-  if (!re.test(readme)) throw new Error(`README marker ${k} missing`);
+  if (!re.test(readme)) { if (k === "chainstop") continue; throw new Error(`README marker ${k} missing`); }
   readme = readme.replace(re, (_m, a: string, b: string) => `${a}\n${v}\n${b}`);
 }
 writeFileSync("README.md", readme);

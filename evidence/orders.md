@@ -1,6 +1,6 @@
 # Orders placed by the bot on Somnia Tokyo testnet (Hideki, chain 50383)
 
-Generated 2026-10-29T02:15:17.786Z by scripts/evidence.ts from the bot's order log, every row re-read from the chain: 34/34 receipts are `success`, sent by the user's linked bot key and calling `placeOrderFor(account, ...)` on the market's perp pool. "via card" marks an order opened from a shared card (Copy this trade).
+Generated 2026-10-29T06:11:30.514Z by scripts/evidence.ts from the bot's order log, every row re-read from the chain: 37/37 receipts are `success`, sent by the user's linked bot key and calling `placeOrderFor(account, ...)` on the market's perp pool. "via card" marks an order opened from a shared card (Copy this trade).
 
 Accounts: `0x2a11e7388d1d2f9690f2636846d44b478f61bf08`, `0x0e7e8df6eac2e14165b4fa4cb2bd4e445d0e3817`. "trigger to close" (bot exits from 2026-10-29): time from the mark update that crossed the level to the confirmed close, from the bot's own clock.
 
@@ -40,3 +40,6 @@ Accounts: `0x2a11e7388d1d2f9690f2636846d44b478f61bf08`, `0x0e7e8df6eac2e14165b4f
 | 10-29 01:16:52 | close |  | XRP-PERP | short | 9.1 | 1.3173 | [0x2e6d136d76…](https://explorer.testnet.somnia.network/tokyo/tx/0x2e6d136d76c96a6ee7e79d711d0fb7cfab8c8cea9b8dc3c764c1a3ffae275c79) | 35834225 | success |  | `0x2A11…bF08` |
 | 10-29 02:08:05 | open | try | ETH-PERP | long | 0.0052 | 2307.05 | [0x195509016a…](https://explorer.testnet.somnia.network/tokyo/tx/0x195509016abd538ef75a14878fadf0bb17c1d71bead1439d29937262927aaba7) | 35864938 | success |  | `0x2A11…bF08` |
 | 10-29 02:14:09 | close (stop-loss) |  | ETH-PERP | short | 0.0052 | 2301.86 | [0xa148b523b3…](https://explorer.testnet.somnia.network/tokyo/tx/0xa148b523b3cec41ad18b38e038fcad96018607f1dd3e93c59c6f8b1cf3a51d62) | 35868579 | success | 2.5 s | `0x2A11…bF08` |
+| 10-29 05:24:23 | open |  | HYPE-PERP | long | 0.12 | 79.37 | [0x1722a8ce06…](https://explorer.testnet.somnia.network/tokyo/tx/0x1722a8ce06557ccbf2afdb3f0ce39d9c886fb23b91d488ea8bb1db2325e3d030) | 35982688 | success |  | `0x2A11…bF08` |
+| 10-29 06:07:40 | open |  | HYPE-PERP | long | 0.12 | 79.31 | [0x83107465b1…](https://explorer.testnet.somnia.network/tokyo/tx/0x83107465b11200f9cb2969b70f416be5a38128e84c9bd47baa25b8280cdfbe48) | 36008646 | success |  | `0x2A11…bF08` |
+| 10-29 06:08:49 | close |  | HYPE-PERP | short | 0.12 | 79.26 | [0x5a5fe92063…](https://explorer.testnet.somnia.network/tokyo/tx/0x5a5fe92063759d721ecddee54b35c245de15fc96e4de45fab6aaff391a1c1903) | 36009333 | success |  | `0x2A11…bF08` |

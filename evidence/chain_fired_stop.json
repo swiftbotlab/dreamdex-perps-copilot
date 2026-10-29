@@ -1,0 +1,110 @@
+{
+ "title": "Chain-fired stop-loss: closed by Somnia Reactivity while the bot was stopped",
+ "chainId": 50383,
+ "account": "0x2A11e7388D1D2F9690f2636846d44b478f61bF08",
+ "generated": "2026-10-29T06:22:49.695Z",
+ "implementation": {
+  "address": "0xd40f8e482bbc195e383571ddafe0a1bddbc703d9",
+  "deployTx": "0x7d848f1a1b604bd30ea15ae0fd062efd62b4e964f67b618d425716aee7ec5605",
+  "block": 36004231,
+  "time": "2026-10-29T06:00:18Z",
+  "gasUsed": 33228665,
+  "codeBytes": 9967
+ },
+ "delegation": {
+  "tx": "0x39b25d4f99f5468f23bc1abca966c5ce026e54ec8ddc5f8e978e5c8cc1e56045",
+  "type": "eip7702",
+  "block": 36004359,
+  "time": "2026-10-29T06:00:31Z",
+  "gasUsed": 1191067,
+  "authorization": {
+   "address": "0xd40f8e482bbc195e383571ddafe0a1bddbc703d9",
+   "chainId": 50383,
+   "nonce": 49
+  },
+  "accountCodeNow": "0xef0100d40f8e482bbc195e383571ddafe0a1bddbc703d9"
+ },
+ "open": {
+  "tx": "0x1722a8ce06557ccbf2afdb3f0ce39d9c886fb23b91d488ea8bb1db2325e3d030",
+  "from": "0xdd5ddd125d6a9b3d4641e5bdb5456e5ec098fb18",
+  "block": 35982688,
+  "time": "2026-10-29T05:24:23Z",
+  "note": "placeOrderFor(demo account, ...) sent by the linked bot key: /long HYPE 2 5x sl 1.5% in Telegram"
+ },
+ "arm": {
+  "tx": "0x28b80fdf62b770332a0314a9cf0a592aa4f6ce8e444c33dbcbbb9d9e0c44ff78",
+  "block": 36004876,
+  "time": "2026-10-29T06:01:23Z",
+  "gasUsed": 606733,
+  "subscriptionLogs": 2,
+  "pool": "0x63B47eD4A7DE0FdE659b0d82441dD74828b7297A",
+  "isLong": true,
+  "sl": 79.21,
+  "tp": null,
+  "markAtArm": 79.2636110186425,
+  "slippageBps": 100,
+  "maxChecks": 20000,
+  "expiresAt": "2026-10-29T12:01:22Z",
+  "intervalMs": 5000,
+  "scheduleSubscription": "23451436",
+  "heartbeatSubscription": "23451437"
+ },
+ "botStopped": "2026-10-29T06:02:21.191Z",
+ "fire": {
+  "tx": "0x2be38f67d9ceafae7168c7ee1db6fd25b2075c25b7f5245dcf2df9074f72ec89",
+  "block": 36006471,
+  "time": "2026-10-29T06:04:03Z",
+  "gasUsed": 1706154,
+  "effectiveGasPriceGwei": 8,
+  "from": "0x2a11e7388d1d2f9690f2636846d44b478f61bf08",
+  "to": "0x2a11e7388d1d2f9690f2636846d44b478f61bf08",
+  "type": "legacy",
+  "nonce": "604088341364736",
+  "nonceBlock": 36006471,
+  "nonceQueueIndex": 0,
+  "signature": {
+   "r": "0x1",
+   "s": "0x1"
+  },
+  "selector": "0x53edf33d",
+  "kind": "stop-loss",
+  "mark": 79.207768195562,
+  "trigger": 79.21,
+  "quantityRaw": "120000",
+  "remainingRaw": "0",
+  "checks": 33,
+  "poolOrderPlacedLogs": 1,
+  "poolOrderFilledLogs": 1,
+  "avgFillPrice": 79.19,
+  "positionAfterRaw": "0",
+  "ended": {
+   "reason": "fired: position closed",
+   "scheduleUnsubscribed": true,
+   "tickUnsubscribed": true
+  }
+ },
+ "botStarted": "2026-10-29T06:04:50.193Z",
+ "timings": {
+  "armToFireS": 160,
+  "botStoppedToFireS": 102,
+  "fireToBotStartS": 47
+ },
+ "noncesBefore": {
+  "account": 51,
+  "botKey": 35
+ },
+ "noncesAfter": {
+  "account": 51,
+  "botKey": 35
+ },
+ "subscriptionsNow": [],
+ "costs": {
+  "sttSpentArmToFire": 0.094,
+  "closeStt": 0.0136,
+  "perWakeStt": 0.00251,
+  "accountNonceArmToFire": [
+   51,
+   51
+  ]
+ }
+}

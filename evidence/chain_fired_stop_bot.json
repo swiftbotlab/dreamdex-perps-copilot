@@ -1,0 +1,29 @@
+{
+ "note": "The indexer-lag footnote of /stops is left out. Captured on the demo account with a second, wider stop (SL 78.49, every 15 s) armed for the capture and disarmed a minute later; the position was then closed with /close HYPE.",
+ "quotes": [
+  {
+   "t": "2026-10-29T06:07:22Z",
+   "cmd": "/stops",
+   "after": "the chain-fired stop-loss of 06:04:03",
+   "text": "HYPE-PERP (no position)\nℹ️ Last chain-fired stop on HYPE-PERP: fired: position closed at block 36006471 after 33 checks."
+  },
+  {
+   "t": "2026-10-29T06:08:22Z",
+   "cmd": "/stops",
+   "after": "arming a second stop for the capture",
+   "text": "HYPE-PERP long 0.12 · mark 79.281\n⛓ Chain-fired stop armed on HYPE-PERP long: SL 78.49, whole position, fills at most 1.00% from the mark. Somnia Reactivity wakes it every 15 s and every epoch; checked 2 times · last mark it saw 79.2805 · 60 min left. It closes even if this bot is offline.\nBot-side layer: SL 78.120 (this bot closes the position when the pushed mark crosses)\n\n0 chain-held stops + 1 chain-fired stop armed (ExitGuard), 0 warnings"
+  },
+  {
+   "t": "2026-10-29T06:08:25Z",
+   "cmd": "/positions",
+   "after": "",
+   "text": "HYPE-PERP long 0.12 (9.51 USDso)\nentry 79.310 · mark 79.289\n...\nchain-fired stop armed: SL 78.490 ⛓ (ExitGuard, fires with no bot; /stops)\nbot-side: SL 78.120"
+  }
+ ],
+ "txs": {
+  "open": "0x83107465b11200f9cb2969b70f416be5a38128e84c9bd47baa25b8280cdfbe48",
+  "arm": "0x69eef74837297635a0add1c1886c5a583f5b0267e5cdc85562897ed6a997dc66",
+  "disarm": "0x2b330ce6dd836b1e6f64f396d26b177b049bb8eb635c0975d314d20c74cef875",
+  "close": "0x5a5fe92063759d721ecddee54b35c245de15fc96e4de45fab6aaff391a1c1903"
+ }
+}

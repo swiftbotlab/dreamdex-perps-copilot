@@ -1,12 +1,12 @@
 {
- "generated": "2026-10-29T02:15:17.785Z",
+ "generated": "2026-10-29T06:11:30.513Z",
  "chainId": 50383,
  "accounts": [
   "0x2a11e7388d1d2f9690f2636846d44b478f61bf08",
   "0x0e7e8df6eac2e14165b4fa4cb2bd4e445d0e3817"
  ],
- "verified": 34,
- "total": 34,
+ "verified": 37,
+ "total": 37,
  "orders": [
   {
    "time": "2026-10-20T13:43:08Z",
@@ -687,6 +687,66 @@
    "gasUsed": 1573877,
    "triggerToCloseS": 2.462,
    "triggerSource": "push"
+  },
+  {
+   "time": "2026-10-29T05:24:23Z",
+   "logged": "2026-10-29T05:24:24.234Z",
+   "kind": "open",
+   "reason": null,
+   "via": null,
+   "market": "HYPE-PERP",
+   "side": "long",
+   "filled": 0.12,
+   "avgPrice": 79.37,
+   "hash": "0x1722a8ce06557ccbf2afdb3f0ce39d9c886fb23b91d488ea8bb1db2325e3d030",
+   "block": 35982688,
+   "status": "success",
+   "verified": true,
+   "from": "0xdd5ddd125d6a9b3d4641e5bdb5456e5ec098fb18",
+   "account": "0x2A11e7388D1D2F9690f2636846d44b478f61bF08",
+   "gasUsed": 1519633,
+   "triggerToCloseS": null,
+   "triggerSource": null
+  },
+  {
+   "time": "2026-10-29T06:07:40Z",
+   "logged": "2026-10-29T06:07:41.031Z",
+   "kind": "open",
+   "reason": null,
+   "via": null,
+   "market": "HYPE-PERP",
+   "side": "long",
+   "filled": 0.12,
+   "avgPrice": 79.31,
+   "hash": "0x83107465b11200f9cb2969b70f416be5a38128e84c9bd47baa25b8280cdfbe48",
+   "block": 36008646,
+   "status": "success",
+   "verified": true,
+   "from": "0xdd5ddd125d6a9b3d4641e5bdb5456e5ec098fb18",
+   "account": "0x2A11e7388D1D2F9690f2636846d44b478f61bF08",
+   "gasUsed": 1677228,
+   "triggerToCloseS": null,
+   "triggerSource": null
+  },
+  {
+   "time": "2026-10-29T06:08:49Z",
+   "logged": "2026-10-29T06:08:49.668Z",
+   "kind": "close",
+   "reason": "manual close",
+   "via": null,
+   "market": "HYPE-PERP",
+   "side": "short",
+   "filled": 0.12,
+   "avgPrice": 79.26,
+   "hash": "0x5a5fe92063759d721ecddee54b35c245de15fc96e4de45fab6aaff391a1c1903",
+   "block": 36009333,
+   "status": "success",
+   "verified": true,
+   "from": "0xdd5ddd125d6a9b3d4641e5bdb5456e5ec098fb18",
+   "account": "0x2A11e7388D1D2F9690f2636846d44b478f61bF08",
+   "gasUsed": 1594560,
+   "triggerToCloseS": null,
+   "triggerSource": null
   }
  ]
 }

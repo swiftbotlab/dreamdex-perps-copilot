@@ -103,6 +103,62 @@
   Telegram's limit; a warning about the same stop and problem is sent at most once a day, and only
   marked as sent once Telegram accepted it.
 
+## Chain-fired stop (ExitGuard: EIP-7702 + Somnia Reactivity)
+`chain/src/ExitGuard.sol` (version 3) is a small contract an account points its own code at with one EIP-7702
+transaction. The account then arms a stop on itself; Somnia Reactivity wakes the account every `intervalMs` (a
+one-shot `Schedule` it renews on every wake) and at every epoch, and when the mark crosses the level the account
+closes its own position. Used on the bot's own demo account only; the bot never holds that account's key and only
+READS the stop (`/stops`, `/positions`), and only for an account whose code is exactly the designator for our
+implementation address (`EXITGUARD_IMPL` in `src/config.ts`).
+
+What the code can do, and nothing else: one order on the opposite side of the account's own position on the armed
+pool, sized from the position read in the same transaction (never more than it), immediate-or-cancel, with a limit
+at most `slippageBps` (1-500) from the mark it checked; create and remove the account's own subscriptions (the
+schedule and the heartbeat). No arbitrary calls, no approvals, no transfers, no withdrawals, no initializer, no
+upgrade hook.
+
+| threat | what stops it | test |
+|---|---|---|
+| A stranger arms, disarms or re-arms the stop | `arm` / `disarm` only run for `msg.sender == address(this)` (the account calling itself) | `test_arm_onlySelf` |
+| A stranger calls `onEvent` to fire it | only the precompile `0x0100` may call it | `test_onEvent_auth` |
+| Someone creates their own subscription pointing at the account, to burn its check budget or fork its schedule | a wake counts only when `tx.origin` is the account (a reactive call runs with `tx.origin` = the subscription owner) | `test_onEvent_auth` |
+| Spam that makes it check (and pay) more often | it wakes only on its own system subscriptions (Schedule, EpochTick); logs from any other emitter are ignored; one check per block; spend caps (`maxChecks` <= 1,000,000, expiry <= 7 days) | `test_only_system_wakeups_count`, `test_one_check_per_block_but_the_schedule_still_renews`, `test_expiry_and_budget_end_the_stop` |
+| The schedule forks into several chains (more wakes, more cost) or dies | only a wake at or after the booked time renews it and the used one-shot is removed; an earlier, stray wake only checks; if a renewal fails (e.g. under 32 STT) the epoch heartbeat keeps checking and books it again | `test_each_wake_books_the_next`, `test_stray_wake_checks_but_does_not_fork_the_schedule`, `test_heartbeat_restarts_a_dead_schedule`, `test_used_schedule_is_removed_and_a_failed_removal_does_not_stop_renewal` |
+| The close adds to or flips the position | size read in the same transaction, opposite side only, quantity <= the position (rounded down to the lot); a position closed or flipped elsewhere ends the stop with no order | fuzz `testFuzz_close_is_reduce_only_and_bounded`, `test_position_closed_or_flipped_elsewhere_sends_nothing` |
+| A bad fill on a thin or stacked book | the limit is at most `slippageBps` from the checked mark, rounded toward the safe side of the tick; arming refuses a slippage below one tick | fuzz test, `test_stopLoss_long_closes_whole_position`, `test_arm_validation` |
+| An empty book or a reverting close | caught; up to 3 attempts on later wakes, then the stop ends (`CloseFailed` / `Disarmed` events); a partial fill keeps it armed for the rest | `test_reverting_close_retries_then_gives_up`, `test_partial_fill_keeps_the_rest_armed` |
+| A fake pool | only the owner picks the pool; it must have code, report the dreamDEX MarginBank, and hold a position of the account in that MarginBank; even then it could only waste gas (the account grants nothing) | `test_arm_validation` |
+| Re-entry from the pool during the close | no privileged entry is reachable from the pool (`onlySelf`, precompile check); the stop is cleared before its subscriptions are removed | `test_reentry_from_the_pool_cannot_arm_disarm_or_fire` |
+| Storage clash with another delegate | ERC-7201 namespaced storage in the account | `test_storage_lives_in_the_account_not_the_implementation` |
+| Initialisation front-running (a known EIP-7702 pitfall) | there is no initializer; nothing to initialise | - |
+| Authorization replay on another chain | the authorization is signed for chain 50383 only | live tx |
+| The account can no longer receive STT | `receive()` accepts it (faucet, refunds of dreamDEX stop fees); unknown calls revert | `test_receive_still_works` |
+| A failed unsubscribe leaves a subscription calling | the stop is cleared first, the failure is reported in `Disarmed`, and a late call is a no-op; the key can remove a subscription directly at the precompile | `test_unsubscribe_failure_still_clears_the_stop` |
+
+Operational limits and residual risks:
+- The account pays every wake: measured on testnet about 0.0026 STT (the check, booking the next wake, removing
+  the used one), ~1.8 STT an hour at 5 s. It must hold 32 STT for the precompile to accept each new booking; below
+  that the epoch heartbeat still checks about every 5 minutes. If it cannot cover `30,000,000 gas x fee` (about
+  0.24 STT) the chain stops calling it. `/stops` shows how many checks ran and the last mark seen.
+- It reacts to the pool's own mark (`tryGetMarkPrice`), like dreamDEX's own stops; a manipulated mark can fire it,
+  and the fill is bounded only by the slippage limit. A wick shorter than the interval can be missed.
+- The account's key keeps full power. Removing the delegation while armed would leave the heartbeat calling a
+  code-less account: `scripts/exitguard.ts undelegate` refuses while the account owns subscriptions.
+- Running both layers on one position: the chain-fired close can never flip (same-transaction read), but a bot-side
+  close that lands after it could open the other side. Keep the bot-side level wider than the chain-fired one (the
+  demo used -1.5 % bot-side and -0.06 % chain-fired).
+- Earlier versions on chain, retired: v1 (`0x69b986e6…8cfc06`) woke on every new order on the book, which cost up to
+  ~36 STT an hour on a busy book (and let anyone placing orders make it spend); v2 (`0x67ea0dda…85fddb5`) never
+  renewed its schedule (it compared the wake-up's topic 1, which is the time it fired, to the booked time with `==`).
+- Tests: `chain/test/ExitGuard.t.sol` (26, incl. a 1,000-run fuzz) and `chain/test/ExitGuardFork.t.sol` (2, on a
+  fork of the live HYPE-PERP pool and MarginBank: the bot key still trades for a delegated account; open, arm,
+  cross, close). The fork tests are flaky because Somnia's RPC serves storage at "latest": they passed in 3 of 6
+  runs on v1/v2 (same close path) and failed inside dreamDEX's own oracle/book code on every v3 run; v3's path is
+  shown live instead (`evidence/chain_fired_stop.json`). Mutation check: removing the `tx.origin` check, the side check, `onlySelf`, the precompile check,
+  the safe rounding, the per-block rule, the stray-wake rule, the dead-schedule restart or the removal of used
+  one-shots, or closing one lot too much, each makes at least one test fail; the v2 bug fails four tests.
+  Self-reviewed; no external audit.
+
 ## Chain-link watchdog
 - Every 30 s a block-number read over the SDK's WebSocket. 6 failed checks in a row close the cached
   sockets for that URL and build a fresh client (sends use HTTP and are not affected); 6 more stop the
@@ -196,7 +252,8 @@ Pinned exact versions from npm with lockfile integrity hashes: `@somnia-chain/ma
 
 ## Known limits
 - Take-profit / stop-loss / guard are bot-side: they act only while the bot runs. On-chain stop
-  orders need the account itself, which a linked key cannot sign for.
+  orders need the account itself, which a linked key cannot sign for. The chain-fired ExitGuard stop (above) runs
+  on the demo account, whose owner key armed it; other users would arm it with their own key.
 - Testnet only; the bot refuses to start on any chain id other than 50383.
 - Durability: `users.json` is written to a temp file, fsynced and renamed (atomic), with a second
   copy in `users.json.bak` that is loaded if the main file is unreadable. The order log rotates at 5 MB.

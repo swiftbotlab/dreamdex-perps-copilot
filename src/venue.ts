@@ -4,7 +4,8 @@
 import { ORDER_TYPE, SOMNIA_TESTNET_ADDRESSES, SomniaMarkets } from "@somnia-chain/markets-sdk";
 import { createPublicClient, defineChain, formatUnits, http, parseAbi, toEventSelector, type PublicClient } from "viem";
 import { socketClientCache } from "viem/utils";
-import { CHAIN_ID, INDEXER_URL, LIMITS, RPC_URL, WS_URL } from "./config.ts";
+import { CHAIN_ID, EXITGUARD_IMPL, INDEXER_URL, LIMITS, RPC_URL, WS_URL } from "./config.ts";
+import { readGuard, type GuardView } from "./exitguard.ts";
 import { alignPrice, alignQuantity, perpMarkets, toRaw, type PerpMarket } from "./vendor/perp-core/markets.ts";
 import { createTradingKey, linkStatus, placeFor, SendError, type TradingKey } from "./vendor/perp-core/operator.ts";
 import { KeyedLock } from "./locks.ts";
@@ -240,6 +241,23 @@ export class Venue {
       out.set(owner, list);
     }
     return out;
+  }
+
+  /**
+   * The account's chain-fired stop (ExitGuard via EIP-7702), if its code points at OUR implementation; plus the head
+   * block (to tell a recent end from an old one). Read only, cached 10 s per account.
+   */
+  private guardCache = new Map<string, { at: number; v: GuardView & { head?: number } }>();
+  async guard(owner: `0x${string}`): Promise<GuardView & { head?: number }> {
+    const k = owner.toLowerCase();
+    const hit = this.guardCache.get(k);
+    if (hit && Date.now() - hit.at < 10_000) return hit.v;
+    const g = await readGuard(this.pub, owner, EXITGUARD_IMPL); // one eth_getCode unless the account uses our ExitGuard
+    const head = g.delegated ? await this.pub.getBlockNumber().catch(() => undefined) : undefined;
+    const v = { ...g, head: head === undefined ? undefined : Number(head) };
+    if (this.guardCache.size >= 500) this.guardCache.clear();
+    this.guardCache.set(k, { at: Date.now(), v });
+    return v;
   }
 
   /** How far the dreamDEX indexer is behind the chain, in seconds (cached 30 s); undefined when unknown. */

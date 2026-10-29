@@ -37,6 +37,7 @@ table { border-collapse:collapse; width:100%; font-size:.86rem; min-width: 860px
 th, td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--line); white-space:nowrap; }
 th { color:var(--mut); font-weight:600; position:sticky; top:0; background:var(--card); }
 td.n { text-align:right; font-variant-numeric: tabular-nums; }
+table.facts { min-width: 0; } table.facts td, table.facts th { white-space: normal; vertical-align: top; } table.facts td:first-child { white-space: nowrap; }
 .ok { color:var(--ok); } .bad { color:var(--bad); }
 footer { margin-top:40px; color:var(--mut); font-size:.85rem; }
 </style>
@@ -48,10 +49,10 @@ footer { margin-top:40px; color:var(--mut); font-size:.85rem; }
 <div class="links"><a href="https://t.me/SwiftPerpsBot">Open @SwiftPerpsBot</a><a href="https://github.com/swiftbotlab/dreamdex-perps-copilot">GitHub repo</a><a href="https://youtu.be/rWLEHY_x_j4">Demo video</a><a href="https://github.com/swiftbotlab/dreamdex-perps-copilot/blob/main/evidence/orders.md">Order table (Markdown)</a><a href="https://github.com/swiftbotlab/dreamdex-perps-copilot/blob/main/evidence/orders.csv">CSV</a></div>
 
 <div class="tiles">
-<div class="tile"><b>34</b><span>orders the bot sent on chain, 34 verified <code>success</code></span></div>
+<div class="tile"><b>37</b><span>orders the bot sent on chain, 37 verified <code>success</code></span></div>
 <div class="tile"><b>9</b><span>exits the bot fired by itself (take-profit, stop-loss, guard)</span></div>
 <div class="tile"><b>2.5 s</b><span>from the pushed mark crossing a TP/SL level to the confirmed close (latest of 2 measured)</span></div>
-<div class="tile"><b>3</b><span>days with orders; newest 2026-10-29 02:14 UTC</span></div>
+<div class="tile"><b>3</b><span>days with orders; newest 2026-10-29 06:08 UTC</span></div>
 </div>
 
 <h2>Try it in 60 seconds</h2>
@@ -62,6 +63,34 @@ footer { margin-top:40px; color:var(--mut); font-size:.85rem; }
 <li><code>/watch 0xAnyAccount</code>: liquidation pings for any account. Read only.</li>
 <li><code>/start</code>, Link a bot in the dreamDEX app, then <code>/long ETH 20 5x tp 4% sl 2%</code>.</li>
 </ol>
+
+
+<h2>Chain-fired stop-loss: closed by Somnia Reactivity while the bot was stopped</h2>
+<p>The demo account <a href="https://explorer.testnet.somnia.network/tokyo/address/0x2A11e7388D1D2F9690f2636846d44b478f61bF08"><code>0x2A11…bF08</code></a> points its code at <a href="https://explorer.testnet.somnia.network/tokyo/address/0xd40f8e482bbc195e383571ddafe0a1bddbc703d9">ExitGuard</a> (our 9967-byte contract, <a href="https://github.com/swiftbotlab/dreamdex-perps-copilot/blob/main/chain/src/ExitGuard.sol">source</a>) with one EIP-7702 transaction, and arms a stop on itself. From then on Somnia Reactivity wakes the account every 5 s (a one-shot Schedule it renews on every wake) and every epoch; when the mark crosses the level, the account closes its own position. Nobody signs that close: it is a reactive transaction the validators add to the block. This run was made with the Telegram bot <b>stopped</b>.</p>
+<ol class="steps">
+<li><div class="st"><span class="t">05:24:23</span><span class="who b">bot</span></div><div><code>/long HYPE 2 5x sl 1.5%</code> in Telegram: the bot opened 0.12 HYPE long through its linked key, as for any user (the bot-side SL at -1.5 % stays as a fallback) · <a href="https://explorer.testnet.somnia.network/tokyo/tx/0x1722a8ce06557ccbf2afdb3f0ce39d9c886fb23b91d488ea8bb1db2325e3d030"><code>0x1722a8ce…e3d030</code></a></div></li>
+<li><div class="st"><span class="t">06:00:18</span><span class="who o">account owner</span></div><div>Deployed ExitGuard (33,228,665 gas) · <a href="https://explorer.testnet.somnia.network/tokyo/tx/0x7d848f1a1b604bd30ea15ae0fd062efd62b4e964f67b618d425716aee7ec5605"><code>0x7d848f1a…ec5605</code></a></div></li>
+<li><div class="st"><span class="t">06:00:31</span><span class="who o">account owner</span></div><div>EIP-7702 (type-4) transaction: the account's code is now <code>0xef0100</code> + ExitGuard (authorization for chain 50383) · <a href="https://explorer.testnet.somnia.network/tokyo/tx/0x39b25d4f99f5468f23bc1abca966c5ce026e54ec8ddc5f8e978e5c8cc1e56045"><code>0x39b25d4f…e56045</code></a></div></li>
+<li><div class="st"><span class="t">06:01:23</span><span class="who o">account owner</span></div><div>Armed the chain-fired stop: SL 79.21 (mark 79.264), fills at most 1.00 % from the mark, at most 20,000 checks, expires 12:01 UTC. Reactivity subscriptions owned by the account: <code>23451436</code> (a wake-up in 5 s, renewed on every wake) and <code>23451437</code> (every epoch) · <a href="https://explorer.testnet.somnia.network/tokyo/tx/0x28b80fdf62b770332a0314a9cf0a592aa4f6ce8e444c33dbcbbb9d9e0c44ff78"><code>0x28b80fdf…44ff78</code></a></div></li>
+<li><div class="st"><span class="t">06:02:21</span><span class="who o">operator</span></div><div><code>systemctl --user stop ddmvp</code>: the bot process is stopped (systemd journal: "Stopped ddmvp.service")</div></li>
+<li><div class="st"><span class="t">06:04:03</span><span class="who b">chain</span></div><div><b>stop-loss fired by the chain</b> after 33 checks: mark 79.2078 at or below 79.21; the account sold its whole position in the same transaction (1 fill at 79.19), then removed both subscriptions (fired: position closed) · <a href="https://explorer.testnet.somnia.network/tokyo/tx/0x2be38f67d9ceafae7168c7ee1db6fd25b2075c25b7f5245dcf2df9074f72ec89"><code>0x2be38f67…72ec89</code></a></div></li>
+<li><div class="st"><span class="t">06:04:50</span><span class="who o">operator</span></div><div><code>systemctl --user restart ddmvp</code>: the bot is back; it finds the position already closed</div></li>
+</ol>
+<div class="scroll"><table class="facts">
+<thead><tr><th>check</th><th>what the chain shows</th></tr></thead>
+<tbody>
+<tr><td>Who sent the close</td><td>from <a href="https://explorer.testnet.somnia.network/tokyo/address/0x2a11e7388d1d2f9690f2636846d44b478f61bf08"><code>0x2a11…bf08</code></a> (the subscription owner) to itself, input <code>onEvent(...)</code>, type legacy, signature r = 0x1, s = 0x1 (a placeholder: nobody signed it)</td></tr>
+<tr><td>Reactive nonce</td><td><code>604088341364736</code> = block 36006471 &lt;&lt; 24 | queue position 0: a validator-made reactive transaction, not one of the account's own nonces</td></tr>
+<tr><td>Account and bot key nonces</td><td>demo account 51 → 51, bot key 35 → 35 across the window: neither key sent anything</td></tr>
+<tr><td>Timings</td><td>armed → fired 160 s · bot stopped → fired 102 s · fired → bot back 47 s</td></tr>
+<tr><td>Gas</td><td>delegation 1,191,067 · arm 606,733 · the close 1,706,154 at 8 gwei · the account paid 0.094 STT from arming to the fire (33 wake-ups at ~0.00251 STT each, and 0.0136 STT for the close)</td></tr>
+</tbody></table></div>
+<p class="mut">What the bot shows (its Telegram replies, copied as sent). The indexer-lag footnote of /stops is left out. Captured on the demo account with a second, wider stop (SL 78.49, every 15 s) armed for the capture and disarmed a minute later; the position was then closed with /close HYPE. Txs: open <a href="https://explorer.testnet.somnia.network/tokyo/tx/0x83107465b11200f9cb2969b70f416be5a38128e84c9bd47baa25b8280cdfbe48"><code>0x83107465…dfbe48</code></a>, arm <a href="https://explorer.testnet.somnia.network/tokyo/tx/0x69eef74837297635a0add1c1886c5a583f5b0267e5cdc85562897ed6a997dc66"><code>0x69eef748…97dc66</code></a>, disarm <a href="https://explorer.testnet.somnia.network/tokyo/tx/0x2b330ce6dd836b1e6f64f396d26b177b049bb8eb635c0975d314d20c74cef875"><code>0x2b330ce6…cef875</code></a>, close <a href="https://explorer.testnet.somnia.network/tokyo/tx/0x5a5fe92063759d721ecddee54b35c245de15fc96e4de45fab6aaff391a1c1903"><code>0x5a5fe920…1c1903</code></a>.</p>
+<div class="st"><span class="t">06:07:22</span><span class="who b">bot</span><code>/stops</code> <span>after the chain-fired stop-loss of 06:04:03</span></div><blockquote>HYPE-PERP (no position)<br>ℹ️ Last chain-fired stop on HYPE-PERP: fired: position closed at block 36006471 after 33 checks.</blockquote>
+<div class="st"><span class="t">06:08:22</span><span class="who b">bot</span><code>/stops</code> <span>after arming a second stop for the capture</span></div><blockquote>HYPE-PERP long 0.12 · mark 79.281<br>⛓ Chain-fired stop armed on HYPE-PERP long: SL 78.49, whole position, fills at most 1.00% from the mark. Somnia Reactivity wakes it every 15 s and every epoch; checked 2 times · last mark it saw 79.2805 · 60 min left. It closes even if this bot is offline.<br>Bot-side layer: SL 78.120 (this bot closes the position when the pushed mark crosses)<br><br>0 chain-held stops + 1 chain-fired stop armed (ExitGuard), 0 warnings</blockquote>
+<div class="st"><span class="t">06:08:25</span><span class="who b">bot</span><code>/positions</code></div><blockquote>HYPE-PERP long 0.12 (9.51 USDso)<br>entry 79.310 · mark 79.289<br>...<br>chain-fired stop armed: SL 78.490 ⛓ (ExitGuard, fires with no bot; /stops)<br>bot-side: SL 78.120</blockquote>
+<p class="mut">This is ExitGuard version 3. Version 1 woke on every new order on the book and would have cost up to ~36 STT an hour on a busy book; version 2 never renewed its schedule. Both are retired; their transactions are in <a href="https://github.com/swiftbotlab/dreamdex-perps-copilot/blob/main/evidence/exitguard_ops.jsonl">evidence/exitguard_ops.jsonl</a> and what each taught us is in the README.</p>
+<p class="mut">Limits: one stop per account (one market) at a time; a check every 5 s, each paid by the account (about 0.0026 STT, ~1.8 STT an hour), and the account must keep 32 STT to renew its wake-up (below that the epoch heartbeat still checks every ~5 minutes); the level here was set 0.06 % under the mark so it would fire within minutes for this run. Testnet only.</p>
 
 <h2>Chain-held stop check, live on Somnia Tokyo testnet (2026-10-29)</h2>
 <p class="mut">Account <a href="https://explorer.testnet.somnia.network/tokyo/address/0x2A11e7388D1D2F9690f2636846d44b478f61bF08"><code>0x2A11…bF08</code></a>. Owner-side steps (arming the TP/SL bracket, resting an order, cancelling) were sent by the account owner with the dreamDEX SDK, as a trader does in the app. The bot only read them and answered in Telegram; the quotes are the bot's messages, copied as sent.</p>
@@ -87,6 +116,9 @@ footer { margin-top:40px; color:var(--mut); font-size:.85rem; }
 <div class="scroll"><table>
 <thead><tr><th>UTC</th><th>action</th><th>market</th><th>filled</th><th>avg price</th><th>tx</th><th>block</th><th>status</th><th>trigger→close</th><th>account</th></tr></thead>
 <tbody>
+<tr><td>10-29 06:08</td><td>close</td><td>HYPE-PERP short</td><td class="n">0.12</td><td class="n">79.26</td><td><a href="https://explorer.testnet.somnia.network/tokyo/tx/0x5a5fe92063759d721ecddee54b35c245de15fc96e4de45fab6aaff391a1c1903"><code>0x5a5fe920…1c1903</code></a></td><td class="n">36009333</td><td><span class="ok">success</span></td><td class="n"></td><td><a href="https://explorer.testnet.somnia.network/tokyo/address/0x2A11e7388D1D2F9690f2636846d44b478f61bF08"><code>0x2A11…bF08</code></a></td></tr>
+<tr><td>10-29 06:07</td><td>open</td><td>HYPE-PERP long</td><td class="n">0.12</td><td class="n">79.31</td><td><a href="https://explorer.testnet.somnia.network/tokyo/tx/0x83107465b11200f9cb2969b70f416be5a38128e84c9bd47baa25b8280cdfbe48"><code>0x83107465…dfbe48</code></a></td><td class="n">36008646</td><td><span class="ok">success</span></td><td class="n"></td><td><a href="https://explorer.testnet.somnia.network/tokyo/address/0x2A11e7388D1D2F9690f2636846d44b478f61bF08"><code>0x2A11…bF08</code></a></td></tr>
+<tr><td>10-29 05:24</td><td>open</td><td>HYPE-PERP long</td><td class="n">0.12</td><td class="n">79.37</td><td><a href="https://explorer.testnet.somnia.network/tokyo/tx/0x1722a8ce06557ccbf2afdb3f0ce39d9c886fb23b91d488ea8bb1db2325e3d030"><code>0x1722a8ce…e3d030</code></a></td><td class="n">35982688</td><td><span class="ok">success</span></td><td class="n"></td><td><a href="https://explorer.testnet.somnia.network/tokyo/address/0x2A11e7388D1D2F9690f2636846d44b478f61bF08"><code>0x2A11…bF08</code></a></td></tr>
 <tr><td>10-29 02:14</td><td>close · stop-loss (bot)</td><td>ETH-PERP short</td><td class="n">0.0052</td><td class="n">2301.86</td><td><a href="https://explorer.testnet.somnia.network/tokyo/tx/0xa148b523b3cec41ad18b38e038fcad96018607f1dd3e93c59c6f8b1cf3a51d62"><code>0xa148b523…a51d62</code></a></td><td class="n">35868579</td><td><span class="ok">success</span></td><td class="n">2.5 s</td><td><a href="https://explorer.testnet.somnia.network/tokyo/address/0x2A11e7388D1D2F9690f2636846d44b478f61bF08"><code>0x2A11…bF08</code></a></td></tr>
 <tr><td>10-29 02:08</td><td>open</td><td>ETH-PERP long</td><td class="n">0.0052</td><td class="n">2307.05</td><td><a href="https://explorer.testnet.somnia.network/tokyo/tx/0x195509016abd538ef75a14878fadf0bb17c1d71bead1439d29937262927aaba7"><code>0x19550901…7aaba7</code></a></td><td class="n">35864938</td><td><span class="ok">success</span></td><td class="n"></td><td><a href="https://explorer.testnet.somnia.network/tokyo/address/0x2A11e7388D1D2F9690f2636846d44b478f61bF08"><code>0x2A11…bF08</code></a></td></tr>
 <tr><td>10-29 01:16</td><td>close</td><td>XRP-PERP short</td><td class="n">9.1</td><td class="n">1.3173</td><td><a href="https://explorer.testnet.somnia.network/tokyo/tx/0x2e6d136d76c96a6ee7e79d711d0fb7cfab8c8cea9b8dc3c764c1a3ffae275c79"><code>0x2e6d136d…275c79</code></a></td><td class="n">35834225</td><td><span class="ok">success</span></td><td class="n"></td><td><a href="https://explorer.testnet.somnia.network/tokyo/address/0x2A11e7388D1D2F9690f2636846d44b478f61bF08"><code>0x2A11…bF08</code></a></td></tr>
@@ -123,7 +155,7 @@ footer { margin-top:40px; color:var(--mut); font-size:.85rem; }
 <tr><td>10-20 13:43</td><td>open</td><td>SOL-PERP long</td><td class="n">0.47</td><td class="n">104.19</td><td><a href="https://explorer.testnet.somnia.network/tokyo/tx/0x7a0b04047f3a6897421d09189d5578443c40faf5eb005c0b581a3f6f19a24729"><code>0x7a0b0404…a24729</code></a></td><td class="n">28518981</td><td><span class="ok">success</span></td><td class="n"></td><td><a href="https://explorer.testnet.somnia.network/tokyo/address/0x0e7E8DF6Eac2E14165b4fA4CB2BD4e445d0E3817"><code>0x0e7E…3817</code></a></td></tr>
 </tbody></table></div>
 
-<footer>Generated 2026-10-29 02:15 UTC (orders) from chain 50383 by <code>scripts/evidence.ts</code> and <code>scripts/evidence_page.ts</code>. Testnet tokens only. Not financial advice. Swift Bot Labs is not affiliated with dreamDEX or Somnia.</footer>
+<footer>Generated 2026-10-29 06:11 UTC (orders) from chain 50383 by <code>scripts/evidence.ts</code> and <code>scripts/evidence_page.ts</code>. Testnet tokens only. Not financial advice. Swift Bot Labs is not affiliated with dreamDEX or Somnia.</footer>
 </main>
 </body>
 </html>

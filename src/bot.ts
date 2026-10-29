@@ -17,6 +17,7 @@ import { Telegram, type Button, type TgCallback, type TgMessage, type TgUpdate }
 import { findLinkedOwners, OutcomeUnknown, UserError, Venue, type AccountView, type Position, type TradeResult } from "./venue.ts";
 import { RpcWatchdog } from "./watchdog.ts";
 import { checkMarket, warnKey, type NativeStop, type PositionReport } from "./stops.ts";
+import { guardLine, lastLine, type GuardView } from "./exitguard.ts";
 import { TRY, TryCaps } from "./trylane.ts";
 import { isJobPosition, SandboxJobs, writeAtomic, type SandboxJob } from "./sandbox.ts";
 
@@ -869,8 +870,10 @@ export class Bot {
       if (!sr) return "chain-held TP/SL: could not be read right now (/stops)";
       const r = sr.reports.find((x) => x.base === base);
       const ls = (r?.lines ?? []).filter((l) => l.kind !== "stop");
-      if (!ls.length) return "chain-held TP/SL: none (only the bot-side exits below)";
-      return `chain-held: ${ls.map((l) => `${l.kind} ${fmtPrice(l.stop.trigger)} ${this.stopIcon(l.level)}`).join(" · ")}${ls.some((l) => l.level === "warn") ? " (see /stops)" : ""}`;
+      const g = sr.guard?.stop && this.guardBase(sr.guard.stop.pool) === base ? sr.guard.stop : undefined;
+      const gTxt = g ? `chain-fired stop armed: SL ${fmtPrice(g.sl)}${g.tp !== undefined ? ` · TP ${fmtPrice(g.tp)}` : ""} ⛓` : "";
+      if (!ls.length) return gTxt ? `${gTxt} (ExitGuard, fires with no bot; /stops)` : "chain-held TP/SL: none (only the bot-side exits below)";
+      return `chain-held: ${ls.map((l) => `${l.kind} ${fmtPrice(l.stop.trigger)} ${this.stopIcon(l.level)}`).join(" · ")}${gTxt ? ` · ${gTxt}` : ""}${ls.some((l) => l.level === "warn") ? " (see /stops)" : ""}`;
     };
     const lines = acct.positions.map((p) => {
       const d = liqDistancePct(p.side, p.mark, p.liq);
@@ -1097,7 +1100,7 @@ export class Bot {
    * (collected only for linked accounts, and shown only to that account's own user, so /stops 0xOther cannot tell
    * whether an account uses this bot).
    */
-  private async stopReports(owner: `0x${string}`, o: { view?: AccountView; fresh?: boolean; withLogs: boolean }): Promise<{ view: AccountView; reports: PositionReport[]; stops: NativeStop[] }> {
+  private async stopReports(owner: `0x${string}`, o: { view?: AccountView; fresh?: boolean; withLogs: boolean }): Promise<Awaited<ReturnType<Bot["stopReportsUncached"]>>> {
     const k = `${owner.toLowerCase()}:${o.withLogs ? 1 : 0}`;
     const c = this.stopCache.get(k);
     if (!o.fresh && !o.view && c && Date.now() - c.at < LIMITS.stopCacheMs) return c.v;
@@ -1108,8 +1111,12 @@ export class Bot {
   }
 
   /** Native stops and the pool's closing capacity for every market with a position or a pending stop. */
-  private async stopReportsUncached(owner: `0x${string}`, view: AccountView | undefined, refs: { registry: `0x${string}`; orderId: string }[]): Promise<{ view: AccountView; reports: PositionReport[]; stops: NativeStop[] }> {
-    const [v, stops] = await Promise.all([view ? Promise.resolve(view) : this.venue.account(owner), this.venue.nativeStops(owner, refs)]);
+  private async stopReportsUncached(owner: `0x${string}`, view: AccountView | undefined, refs: { registry: `0x${string}`; orderId: string }[]): Promise<{ view: AccountView; reports: PositionReport[]; stops: NativeStop[]; guard?: GuardView & { head?: number } }> {
+    const [v, stops, guard] = await Promise.all([
+      view ? Promise.resolve(view) : this.venue.account(owner), this.venue.nativeStops(owner, refs),
+      // ExitGuard (a chain-fired stop on an EIP-7702 account): best effort, never blocks /stops
+      (this.venue.guard?.(owner) ?? Promise.resolve(undefined)).catch(() => undefined),
+    ]);
     const bases = [...new Set([...v.positions.map((p) => p.base), ...stops.map((x) => x.base)])].filter((b) => this.venue.market(b));
     const reports = await Promise.all(bases.map(async (b) => {
       const m = this.venue.market(b)!;
@@ -1120,7 +1127,13 @@ export class Bot {
       if (mine.length && !cap) r.notes.push("The pool's closing capacity could not be read right now, so the resting-order check was skipped");
       return r;
     }));
-    return { view: v, reports, stops };
+    return { view: v, reports, stops, guard };
+  }
+
+  /** The base of the pool an ExitGuard stop is armed on (only a known market's pool; else undefined). */
+  private guardBase(pool: string): string | undefined {
+    const m = this.venue.marketByPool(pool);
+    return m ? this.venue.baseOf(m) : undefined;
   }
 
   private recentRefs(owner: string): { registry: `0x${string}`; orderId: string }[] {
@@ -1150,7 +1163,12 @@ export class Bot {
     const mine = u?.owner?.toLowerCase() === target.toLowerCase() ? u : undefined;
     // Everyone has a per-user limit; checking another account also counts against a global one (your own never waits on others).
     if (!this.buckets.allow(`stops:${id}`, LIMITS.stopsPerMinute, 60_000) || (!mine && !this.buckets.allow("stops:all", LIMITS.stopsGlobalPerMinute, 60_000))) { await this.say(chat, "One moment: /stops works a few times a minute."); return; }
-    const [{ reports }, lag] = await Promise.all([this.stopReports(target, { withLogs: !!mine }), this.venue.indexerLagS().catch(() => undefined)]);
+    const [{ reports, guard }, lag] = await Promise.all([this.stopReports(target, { withLogs: !!mine }), this.venue.indexerLagS().catch(() => undefined)]);
+    // A chain-fired stop (ExitGuard, EIP-7702) on this account: shown in its market's section.
+    const gBase = guard?.stop ? this.guardBase(guard.stop.pool) : undefined;
+    const gLine = guard?.stop && gBase ? `⛓ ${h(guardLine(guard.stop, gBase))}` : undefined;
+    const lBase = !guard?.stop && guard?.last ? this.guardBase(guard.last.pool) : undefined;
+    const lLine = lBase && guard?.last && guard.head !== undefined && guard.head - guard.last.endedAtBlock < 864_000 ? `ℹ️ ${h(lastLine(guard.last, lBase))}` : undefined; // ~1 day of blocks
     const lagNote = lag !== undefined && lag > 30
       ? `\nℹ️ The dreamDEX indexer is ${Math.round(lag)} s behind the chain right now, so a stop armed in that window may show up only once it catches up${mine ? " (for your linked account the bot also reads the registries' own logs every minute)" : ""}.`
       : "";
@@ -1163,8 +1181,13 @@ export class Bot {
       const rule = mine?.rules[r.base];
       const levels = rule ? [rule.tp ? `TP ${fmtPrice(rule.tp)}` : "", rule.sl ? `SL ${fmtPrice(rule.sl)}` : ""].filter(Boolean).join(" · ") : "";
       const bot = levels ? [`Bot-side layer: ${levels} (this bot closes the position when the pushed mark crosses)`] : [];
-      return [head, ...lines, ...notes, ...bot].join("\n");
+      const chain = [gBase === r.base ? gLine : undefined, lBase === r.base ? lLine : undefined].filter((x): x is string => !!x);
+      return [head, ...chain, ...lines, ...notes, ...bot].join("\n");
     });
+    // An armed or recently ended chain-fired stop on a market with no report (no position, no dreamDEX stop) still shows.
+    for (const [b, line] of [[gBase, gLine], [lBase, lLine]] as const) {
+      if (b && line && !reports.some((r) => r.base === b)) parts.unshift(`<b>${b}-PERP</b> (no position)\n${line}`);
+    }
     const warns = reports.reduce((n, r) => n + r.lines.filter((l) => l.level === "warn").length, 0);
     const count = reports.reduce((n, r) => n + r.lines.length, 0);
     // Stay well under Telegram's 4,096 characters: whole markets only (a cut never lands inside a tag).
@@ -1176,7 +1199,7 @@ export class Bot {
       `<b>Chain-held stops</b> for ${addrLink(target)}\n` +
       `dreamDEX TP/SL live in each market's stop registry on chain. The chain checks them and fires them itself, even when no bot is running. This bot reads them and checks that each one will close what you expect.\n\n` +
       (kept.length ? kept.join("\n\n") : "No open positions and no pending chain-held stops.") +
-      `\n\n${count} chain-held stop${count === 1 ? "" : "s"}, ${warns} warning${warns === 1 ? "" : "s"} · checked ${new Date().toISOString().slice(11, 19)} UTC. Arm or cancel stops in the <a href="${APP_URL}">dreamDEX app</a>.` + lagNote);
+      `\n\n${count} chain-held stop${count === 1 ? "" : "s"}${gLine ? " + 1 chain-fired stop armed (ExitGuard)" : ""}, ${warns} warning${warns === 1 ? "" : "s"} · checked ${new Date().toISOString().slice(11, 19)} UTC. Arm or cancel stops in the <a href="${APP_URL}">dreamDEX app</a>.` + lagNote);
   }
 
   /** Every minute: warn linked users (once a day per stop and problem) when a chain-held stop will not close what they expect, and tell them when one fired or was dropped. */
