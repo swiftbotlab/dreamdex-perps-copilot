@@ -17,6 +17,7 @@ import { Telegram, type Button, type TgCallback, type TgMessage, type TgUpdate }
 import { findLinkedOwners, OutcomeUnknown, UserError, Venue, type AccountView, type Position, type TradeResult } from "./venue.ts";
 import { RpcWatchdog } from "./watchdog.ts";
 import { checkMarket, warnKey, type NativeStop, type PositionReport } from "./stops.ts";
+import { TRY, TryCaps } from "./trylane.ts";
 
 const log = (...a: unknown[]) => console.log(new Date().toISOString(), ...a);
 
@@ -84,6 +85,7 @@ export class Bot {
   private stopCursor = 0;                              // rotates through linked users when there are more than one pass takes
   private stopCache = new Map<string, { at: number; v: Awaited<ReturnType<Bot["stopReportsUncached"]>> }>();
   private stopChecking = false;
+  private tryCaps = new TryCaps(`${PATHS.data}/try.json`);
   /** Stop ids found in the registries' own logs (newer than the indexer), per owner (lowercase), kept 15 minutes. */
   private stopLogs = new Map<string, Map<string, { ref: { registry: `0x${string}`; orderId: string }; at: number }>>();
 
@@ -289,6 +291,7 @@ export class Bot {
     if (cmd === "markets") return this.cmdMarkets(chat);
     if (cmd === "demo") return this.cmdDemo(id, chat);
     if (cmd === "stops") return this.cmdStops(id, chat, args[0]);
+    if (cmd === "try") return this.cmdTry(chat);
     if (cmd === "watch" || cmd === "unwatch") {
       // No link and no key needed: watching only reads public chain state. A keyless record holds the watch
       // list, made only for a valid /watch request.
@@ -567,7 +570,7 @@ export class Bot {
     const lat = auto && r.latencyMs !== undefined ? `, closed ${(r.latencyMs / 1000).toFixed(1)} s after the ${r.trigSrc === "poll" ? "polled" : "pushed"} mark crossed` : "";
     const tag = r.kind === "unknown" ? "outcome not confirmed at send" : auto ? `auto: ${auto}${lat}` : r.reason ? h(r.reason.slice(0, 40)) : "";
     const fill = r.filled !== undefined ? ` ${r.filled}${r.avgPrice !== undefined ? ` @ ${fmtPrice(r.avgPrice)}` : ""}` : "";
-    const via = r.via === "card" ? " · card copy" : r.via === "schedule" ? " · scheduled demo trade" : "";
+    const via = r.via === "card" ? " · card copy" : r.via === "schedule" ? " · scheduled demo trade" : r.via === "try" ? " · live trial" : "";
     return `${r.t.slice(5, 16).replace("T", " ")} ${r.kind} ${r.market} ${r.side}${fill}${tag ? ` · ${tag}` : ""}${via} · ${txLink(r.hash)}`;
   }
 
@@ -665,7 +668,7 @@ export class Bot {
     await this.posLock.run(`${tk.owner.toLowerCase()}:${p.base}`, () => this.openLocked(u, chat, side, p, tk));
   }
 
-  private async openLocked(u: User, chat: number, side: Side, p: OpenCmd, tk: ReturnType<Bot["tk"]>, opts: { maxTouchPct?: number; via?: "card" | "schedule"; card?: string; quiet?: boolean } = {}): Promise<TradeResult | undefined> {
+  private async openLocked(u: User, chat: number, side: Side, p: OpenCmd, tk: ReturnType<Bot["tk"]>, opts: { maxTouchPct?: number; via?: "card" | "schedule" | "try"; card?: string; quiet?: boolean } = {}): Promise<TradeResult | undefined> {
     this.notStopping();
     const m = this.venue.market(p.base)!;
     await this.checkUnresolved(tk, p.base);
@@ -882,15 +885,19 @@ export class Bot {
     const demo = this.demoAccount.toLowerCase();
     const u = this.store.all().find((x) => x.owner?.toLowerCase() === demo && hasKey(x));
     if (!u) return "skip: no linked demo user";
-    const acct = await this.venue.account(u.owner!);
-    if (acct.positions.length) return `skip: the demo account holds ${acct.positions.map((p) => p.base).join(", ")}`;
-    if (acct.equity < S.minEquity) return `skip: equity ${acct.equity.toFixed(2)} below ${S.minEquity}`;
     const base = S.markets[runs % S.markets.length]!;
     const side: Side = runs % 2 === 0 ? "long" : "short";
     if (!this.venue.market(base)) return `skip: no ${base} market`;
     const tk = this.tk(u);
     const p: OpenCmd = { kind: "open", side, base, margin: S.margin, leverage: S.leverage, tp: { pct: S.tpPct }, sl: { pct: S.slPct } };
-    const r = await this.posLock.run(`${tk.owner.toLowerCase()}:${base}`, () => this.openLocked(u, 0, side, p, tk, { via: "schedule", quiet: true }));
+    // The checks run inside the account+market lock, so a live trial opened meanwhile is never added to.
+    const r = await this.posLock.run(`${tk.owner.toLowerCase()}:${base}`, async () => {
+      const acct = await this.venue.account(u.owner!);
+      if (acct.positions.length) return `skip: the demo account holds ${acct.positions.map((x) => x.base).join(", ")}`;
+      if (acct.equity < S.minEquity) return `skip: equity ${acct.equity.toFixed(2)} below ${S.minEquity}`;
+      return this.openLocked(u, 0, side, p, tk, { via: "schedule", quiet: true });
+    });
+    if (typeof r === "string") return r;
     if (!r || r.filledBase === 0) return `skip: nothing filled on ${base}`;
     setTimeout(() => void this.scheduledFlatten(u, base, side).catch((e) => log("scheduled flatten failed", base, String(e).slice(0, 160))), S.maxHoldMs).unref();
     return `opened ${side} ${base} ${r.filledBase} (tx ${r.hash})`;
@@ -903,6 +910,63 @@ export class Bot {
     if (!pos || pos.side !== side) return;
     await this.doClose(u, 0, base, 1, `scheduled flatten after ${Math.round(DEMO_SCHEDULE.maxHoldMs / 60_000)} min`, { expectSide: side, auto: true });
     log("demo schedule: flattened", base);
+  }
+
+  // ---------- /try: one real order on the bot's sandbox account, no wallet (off unless data/try.on) ----------
+  private tryEnabled(): boolean { return existsSync(`${PATHS.data}/try.on`) && !existsSync(`${PATHS.data}/try.off`); }
+
+  private async cmdTry(chat: number): Promise<void> {
+    if (!this.tryEnabled()) { await this.say(chat, "Live trials are off right now. /demo shows the bot's live account and its orders, no wallet needed."); return; }
+    await this.say(chat,
+      `<b>Try a real order, no wallet</b>\nThe bot opens a small position on its own testnet sandbox account (not yours; nothing to link): ${fmtUsd(TRY.margin * TRY.leverage)} USDso at ${TRY.leverage}x, ` +
+      `closed at ±${TRY.tpPct}% or after ${Math.round(TRY.maxHoldMs / 60_000)} minutes. You get the transaction link. ${TRY.perUserPerDay} trials a day per person.`,
+      TRY.markets.map((b) => [{ text: `Long ${b}`, callback_data: `ty:${b}:l` }, { text: `Short ${b}`, callback_data: `ty:${b}:s` }]));
+  }
+
+  /** One trial order. Every check happens again inside the account+market lock, right before the send. */
+  private async tryOrder(id: number, chat: number, base: string, side: Side): Promise<void> {
+    if (!this.tryEnabled()) { await this.say(chat, "Live trials are off right now. /demo shows the bot's live account."); return; }
+    this.notStopping();
+    let refused: string | undefined;
+    try { refused = this.tryCaps.refusal(id); } catch (e) {
+      log("trial caps unreadable:", String(e).slice(0, 120));
+      await this.say(chat, "Live trials are not available right now."); return; // fail closed
+    }
+    if (refused) { await this.say(chat, h(refused)); return; }
+    const demo = this.demoAccount.toLowerCase();
+    const u = this.store.all().find((x) => x.owner?.toLowerCase() === demo && hasKey(x));
+    if (!u || !this.venue.market(base) || !(TRY.markets as readonly string[]).includes(base)) { await this.say(chat, "Live trials are not available right now."); return; }
+    const tk = this.tk(u);
+    const r = await this.posLock.run(`${tk.owner.toLowerCase()}:${base}`, async () => {
+      const acct = await this.venue.account(tk.owner);
+      if (acct.positions.some((p) => p.base === base)) throw new UserError(`The sandbox already holds a ${base}-PERP trial. Pick another market or try again in a few minutes.`);
+      if (acct.positions.length >= TRY.maxOpen) throw new UserError("The sandbox is busy with other trials. Try again in a few minutes, or look at /demo.");
+      if (acct.equity < TRY.minEquity) throw new UserError("The sandbox account is resting (low balance). /demo shows its orders.");
+      if ((await this.venue.gasBalance(u.keyAddress!)) < TRY.minGasStt) throw new UserError("The sandbox is resting (low gas). /demo shows its orders.");
+      this.tryCaps.take(id); // counted before the send: a failed send still uses the trial (no retry loops)
+      log("trial", base, side);
+      const p: OpenCmd = { kind: "open", side, base, margin: TRY.margin, leverage: TRY.leverage, tp: { pct: TRY.tpPct }, sl: { pct: TRY.slPct } };
+      return this.openLocked(u, 0, side, p, tk, { via: "try", quiet: true, maxTouchPct: TRY.maxTouchPct });
+    });
+    if (!r || r.filledBase === 0) { await this.say(chat, `Nothing filled (the book moved)${r ? `: tx ${txLink(r.hash)}` : ""}. No position was opened.`); return; }
+    const at = Date.now();
+    await this.say(chat,
+      `<b>Filled</b> ${side} ${r.filledBase} ${base} @ ${r.avgPrice ? fmtPrice(r.avgPrice) : "?"} on the sandbox account ${addrLink(tk.owner)}\nTx ${txLink(r.hash)}\n` +
+      `It closes by itself at ±${TRY.tpPct}% or within ${Math.round(TRY.maxHoldMs / 60_000)} minutes; I tell you how it ended. To trade your own account: /start.`,
+      [[{ text: "Start trading", callback_data: "st" }]]);
+    setTimeout(() => void this.tryEnded(u, chat, base, side, at).catch((e) => log("trial end failed", base, String(e).slice(0, 160))), TRY.maxHoldMs).unref();
+  }
+
+  /** maxHoldMs after a trial: close it if no exit fired, then tell the trier how it ended (from the order log). */
+  private async tryEnded(u: User, chat: number, base: string, side: Side, at: number): Promise<void> {
+    if (u.owner?.toLowerCase() === this.demoAccount.toLowerCase()) {
+      const pos = (await this.venue.account(u.owner)).positions.find((x) => x.base === base);
+      if (pos && pos.side === side) await this.doClose(u, 0, base, 1, `trial closed after ${Math.round(TRY.maxHoldMs / 60_000)} min`, { expectSide: side, auto: true }).catch(() => undefined);
+    }
+    const close = this.store.recentOrders(this.demoAccount, 20).find((x) => x.kind === "close" && x.market === `${base}-PERP` && Date.parse(x.t) >= at);
+    await this.say(chat, close
+      ? `Your ${base}-PERP trial is closed${close.avgPrice !== undefined ? ` @ ${fmtPrice(close.avgPrice)}` : ""}${autoKind(close.reason) ? ` by its ${autoKind(close.reason)}` : ""}. Tx ${txLink(close.hash)}`
+      : `Your ${base}-PERP trial: I could not confirm the close yet. /demo shows the sandbox account.`);
   }
 
   // ---------- /stops: dreamDEX's chain-held TP/SL, mirrored and checked ----------
@@ -1375,6 +1439,8 @@ export class Bot {
       if (data === "st") { await this.cmdStart(q.from.id, chat); return; }
       if (data === "wd") { const r = await this.ensureUser(q.from.id, chat, { key: false }); if (r) await this.cmdWatch(r.user, chat, this.demoAccount); return; }
       if (data === "sk") { await this.cmdStops(q.from.id, chat); return; }
+      const ty = /^ty:(ETH|SOL|XRP):([ls])$/.exec(data);
+      if (ty) { await this.tryOrder(q.from.id, chat, ty[1]!, ty[2] === "l" ? "long" : "short"); return; }
       const wu = this.store.get(q.from.id);
       if (!wu) { await this.say(chat, "Send /start first."); return; }
       // Watch buttons work for watch-only records (no key).
