@@ -18,6 +18,10 @@ import { findLinkedOwners, OutcomeUnknown, UserError, Venue, type AccountView, t
 import { RpcWatchdog } from "./watchdog.ts";
 import { checkMarket, warnKey, type NativeStop, type PositionReport } from "./stops.ts";
 import { TRY, TryCaps } from "./trylane.ts";
+import { isJobPosition, SandboxJobs, writeAtomic, type SandboxJob } from "./sandbox.ts";
+
+/** Scheduled trades and trials refuse a book further than this from the mark, so their 0.3% TP/SL can always be set. */
+const SANDBOX_TOUCH_PCT = 0.15;
 
 const log = (...a: unknown[]) => console.log(new Date().toISOString(), ...a);
 
@@ -86,9 +90,10 @@ export class Bot {
   private stopCache = new Map<string, { at: number; v: Awaited<ReturnType<Bot["stopReportsUncached"]>> }>();
   private stopChecking = false;
   private tryCaps = new TryCaps(`${PATHS.data}/try.json`);
-  /** Sandbox (demo account) positions opened by a trial or a scheduled trade: market -> the open's tx hash. A
-   *  delayed close acts only if the position there is still the one it opened (never a later one). */
-  private sandboxPos = new Map<string, string>();
+  private jobs = new SandboxJobs(`${PATHS.data}/sandbox_jobs.json`);
+  private sweepingSandbox = false;
+  /** Background work that sends orders (schedule ticks, sandbox sweeps): shutdown waits for it. */
+  private bg = new Set<Promise<unknown>>();
   /** Stop ids found in the registries' own logs (newer than the indexer), per owner (lowercase), kept 15 minutes. */
   private stopLogs = new Map<string, Map<string, { ref: { registry: `0x${string}`; orderId: string }; at: number }>>();
 
@@ -167,12 +172,16 @@ export class Bot {
     this.timers.push(setInterval(() => void this.watchdogRound().catch((e) => log("watchdog error", String(e).slice(0, 160))), LIMITS.watchdogMs));
     void this.watchdogRound().catch(() => {}); // first check right away, so /status shows a verified link
     this.timers.push(setInterval(() => void this.stopHealthRound().catch((e) => log("stop check error", String(e).slice(0, 160))), LIMITS.stopCheckMs));
-    this.timers.push(setInterval(() => void this.demoScheduleTick().then((r) => { if (r.startsWith("opened") || r.startsWith("skip")) log("demo schedule:", r); }).catch((e) => log("demo schedule error", String(e).slice(0, 160))), DEMO_SCHEDULE.tickMs));
+    this.timers.push(setInterval(() => this.track(this.demoScheduleTick().then((r) => { if (r.startsWith("opened") || r.startsWith("skip")) log("demo schedule:", r); }).catch((e) => log("demo schedule error", String(e).slice(0, 160)))), DEMO_SCHEDULE.tickMs));
+    this.timers.push(setInterval(() => this.track(this.sandboxSweep().catch((e) => log("sandbox sweep error", String(e).slice(0, 160)))), 60_000));
+    setTimeout(() => this.track(this.sandboxSweep().catch((e) => log("sandbox sweep error", String(e).slice(0, 160)))), 20_000).unref(); // jobs left from before a restart
     setInterval(() => void this.housekeeping().catch((e) => log("housekeeping error", String(e).slice(0, 160))), 10 * 60_000).unref();
     await this.poll();
     await this.shutdown();
     log("stopped");
   }
+
+  private track(p: Promise<unknown>): void { this.bg.add(p); void p.finally(() => this.bg.delete(p)); }
 
   /** SIGTERM / SIGINT: stop polling and stop starting new trades or auto-closes; work already running finishes. */
   private requestStop(): void {
@@ -189,7 +198,7 @@ export class Bot {
     const deadline = (this.stopAt || Date.now()) + LIMITS.shutdownDrainMs;
     // No new work can start (polling and the Protector are stopped), so one pass over what is queued or running drains it.
     const drained = (async () => {
-      do { await Promise.allSettled([...this.queues.values(), this.protector.idle()]); } while (this.queues.size);
+      do { await Promise.allSettled([...this.queues.values(), this.protector.idle(), ...this.bg]); } while (this.queues.size || this.bg.size);
     })();
     let timer: NodeJS.Timeout | undefined;
     const timedOut = new Promise<boolean>((r) => { timer = setTimeout(() => r(false), Math.max(0, deadline - Date.now())); });
@@ -817,21 +826,21 @@ export class Bot {
       const key = `${u.id}:${base}:${opt.kind}`;
       if (e instanceof OutcomeUnknown) {
         if (this.buckets.allow(`autofail:${key}`, 1, 5 * 60_000)) {
-          await this.say(u.id, `⚠️ ${h(reason)}: the close order for ${base}-PERP ${e.hash ? `was sent (tx ${txLink(e.hash)})` : "may have reached the chain"} but its result is not confirmed yet. I re-read the position from the chain before any new attempt. Check /positions.`);
+          await this.say(chat, `⚠️ ${h(reason)}: the close order for ${base}-PERP ${e.hash ? `was sent (tx ${txLink(e.hash)})` : "may have reached the chain"} but its result is not confirmed yet. I re-read the position from the chain before any new attempt. Check /positions.`);
         }
         throw e;
       }
       // A take-profit whose limit the book does not reach yet is not an error: retry quietly on the next pushes.
       const quiet = opt.kind === "tp" && /nothing would fill|thin/i.test(msg);
       if (!quiet && this.buckets.allow(`autofail:${key}`, 1, 5 * 60_000)) {
-        await this.say(u.id, `⚠️ ${h(reason)}, but closing ${base}-PERP failed: ${h(msg)} I keep retrying while the level holds. You can also /close ${base}.`);
+        await this.say(chat, `⚠️ ${h(reason)}, but closing ${base}-PERP failed: ${h(msg)} I keep retrying while the level holds. You can also /close ${base}.`);
       }
       throw e;
     }
   }
 
   private async liqWarn(u: User, base: string, text: string): Promise<void> {
-    if (!u.owner) return;
+    if (!u.owner || u.rules[base]?.quiet) return; // a sandbox position (scheduled trade or trial) warns nobody
     await this.say(u.id, `⚠️ <b>Liquidation risk</b>\n${h(text)}`, [[{ text: "Close 50%", callback_data: closeData(u.owner, base, 50) }, { text: "Close all", callback_data: closeData(u.owner, base, 100) }]]);
   }
 
@@ -868,13 +877,91 @@ export class Bot {
     await this.say(chat, `${lines.join("\n\n")}\n\nEquity ${fmtUsd(acct.equity)} USDso · margin status ${h(acct.status)}`, buttons);
   }
 
-  // ---------- scheduled demo trades (fresh on-chain evidence, no chat messages) ----------
+  // ---------- sandbox positions: scheduled demo trades and /try trials ----------
+  // Both open small positions on the bot's own demo account. Each one is a job in data/sandbox_jobs.json, written
+  // BEFORE the order is sent, with the time by which it must be closed; sandboxSweep (every minute and at start)
+  // closes overdue ones, retries failed closes, and tells a trier how their trial ended. A job closes only the
+  // position it opened (src/sandbox.ts isJobPosition), never a later or a manual one.
   private schedFile(): string { return `${PATHS.data}/demo_schedule.json`; }
   private loadSched(): { lastSlot?: string; runs?: number } {
     try { const j = JSON.parse(readFileSync(this.schedFile(), "utf8")) as { lastSlot?: unknown; runs?: unknown }; return { lastSlot: typeof j.lastSlot === "string" ? j.lastSlot : undefined, runs: Number.isInteger(j.runs) ? (j.runs as number) : 0 }; } catch { return { runs: 0 }; }
   }
+  private demoUser(): KeyedUser | undefined {
+    const demo = this.demoAccount.toLowerCase();
+    return this.store.all().find((x) => x.owner?.toLowerCase() === demo && hasKey(x)) as KeyedUser | undefined;
+  }
 
-  /** Once per slot: one capped order on the demo account with a bot-side TP/SL; flattened after maxHoldMs. Returns what it did. */
+  /**
+   * Open one sandbox position as a job. Inside the account+market lock: `check` (may refuse), the job is written,
+   * then the order goes out with a tight touch cap. A refused or failed send removes the job (nothing was sent);
+   * an unconfirmed send keeps it and has it closed within 2 minutes if it did fill. A fill whose TP or SL could
+   * not be set is closed at the next sweep instead of being left without a stop.
+   */
+  private async openSandbox(u: KeyedUser, kind: "schedule" | "try", base: string, side: Side, o: { margin: number; leverage: number; tpPct: number; slPct: number; holdMs: number; chat?: number; check: () => Promise<string | undefined> }): Promise<{ r?: TradeResult; refused?: string }> {
+    const tk = this.tk(u);
+    return this.posLock.run(`${tk.owner.toLowerCase()}:${base}`, async () => {
+      const refused = await o.check();
+      if (refused) return { refused };
+      const id = randomBytes(6).toString("hex");
+      const at = Date.now();
+      this.jobs.add({ id, kind, base, side, at, deadline: at + o.holdMs, chat: o.chat, attempts: 0 });
+      const p: OpenCmd = { kind: "open", side, base, margin: o.margin, leverage: o.leverage, tp: { pct: o.tpPct }, sl: { pct: o.slPct } };
+      let r: TradeResult | undefined;
+      try {
+        r = await this.openLocked(u, 0, side, p, tk, { via: kind, quiet: true, maxTouchPct: SANDBOX_TOUCH_PCT });
+      } catch (e) {
+        if (e instanceof OutcomeUnknown) this.jobs.update(id, { deadline: Date.now() + 2 * 60_000 }); // may have filled: close it soon
+        else this.jobs.remove(id); // nothing was sent
+        throw e;
+      }
+      if (!r || r.filledBase === 0) { this.jobs.remove(id); return { r }; }
+      const rule = u.rules[base];
+      const covered = !!rule?.tp && !!rule?.sl && rule.side === side;
+      this.jobs.update(id, { hash: r.hash, size: r.filledBase, entry: r.avgPrice, deadline: covered ? at + o.holdMs : Date.now() });
+      if (!covered) log("sandbox: TP/SL not set for", base, "closing at the next sweep");
+      return { r };
+    });
+  }
+
+  /** Every minute and at start: close overdue sandbox jobs (retrying failures), drop finished ones, report trials. */
+  async sandboxSweep(now = Date.now()): Promise<void> {
+    if (this.stopping || this.sweepingSandbox) return;
+    this.sweepingSandbox = true;
+    try {
+      let jobs;
+      try { jobs = this.jobs.all(); } catch (e) { log("sandbox jobs unreadable:", String(e).slice(0, 120)); return; }
+      if (!jobs.length) return;
+      const u = this.demoUser();
+      if (!u) return;
+      const acct = await this.venue.account(u.owner!);
+      for (const job of jobs) {
+        const pos = acct.positions.find((x) => x.base === job.base);
+        if (!pos || pos.side !== job.side) { await this.sandboxDone(job, "closed"); continue; }
+        if (!isJobPosition(job, pos)) { log("sandbox: the", job.base, "position changed; leaving it alone"); await this.sandboxDone(job, "changed"); continue; }
+        if (now < job.deadline) continue;
+        try {
+          const hold = Math.round((job.kind === "try" ? TRY.maxHoldMs : DEMO_SCHEDULE.maxHoldMs) / 60_000);
+          await this.doClose(u, 0, job.base, 1, job.kind === "try" ? `trial closed after ${hold} min` : `scheduled flatten after ${hold} min`, { expectSide: job.side, auto: true, owner: this.demoAccount });
+          log("sandbox: closed", job.kind, job.base);
+          await this.sandboxDone(job, "closed");
+        } catch (e) {
+          this.jobs.update(job.id, { attempts: (job.attempts ?? 0) + 1 });
+          log("sandbox: close failed, retrying next minute:", job.base, String(e instanceof Error ? e.message : e).slice(0, 160));
+        }
+      }
+    } finally { this.sweepingSandbox = false; }
+  }
+
+  private async sandboxDone(job: SandboxJob, how: "closed" | "changed"): Promise<void> {
+    this.jobs.remove(job.id);
+    if (job.kind !== "try" || !job.chat) return;
+    const close = this.store.recentOrders(this.demoAccount, 20).filter((x) => x.kind === "close" && x.market === `${job.base}-PERP` && Date.parse(x.t) >= job.at).at(-1);
+    await this.say(job.chat, how === "closed" && close
+      ? `Your ${job.base}-PERP trial is closed${close.avgPrice !== undefined ? ` @ ${fmtPrice(close.avgPrice)}` : ""}${autoKind(close.reason) ? ` by its ${autoKind(close.reason)}` : ""}. Tx ${txLink(close.hash)}`
+      : `Your ${job.base}-PERP trial has ended. /demo shows the sandbox account and its orders.`);
+  }
+
+  /** Once per slot: one capped order on the demo account; retried within the slot hour while the account is busy. */
   async demoScheduleTick(now = Date.now()): Promise<string> {
     const S = DEMO_SCHEDULE;
     if (this.stopping || now >= S.until || existsSync(`${PATHS.data}/demo_schedule.off`)) return "off";
@@ -883,39 +970,25 @@ export class Bot {
     const slot = d.toISOString().slice(0, 13);
     const st = this.loadSched();
     if (st.lastSlot === slot) return "done";
-    const runs = (st.runs ?? 0) + 1;
-    writeFileSync(this.schedFile(), JSON.stringify({ lastSlot: slot, runs }), { mode: 0o600 }); // first: a crash never repeats a slot
-    const demo = this.demoAccount.toLowerCase();
-    const u = this.store.all().find((x) => x.owner?.toLowerCase() === demo && hasKey(x));
+    const u = this.demoUser();
     if (!u) return "skip: no linked demo user";
+    const runs = (st.runs ?? 0) + 1;
     const base = S.markets[runs % S.markets.length]!;
     const side: Side = runs % 2 === 0 ? "long" : "short";
     if (!this.venue.market(base)) return `skip: no ${base} market`;
-    const tk = this.tk(u);
-    const p: OpenCmd = { kind: "open", side, base, margin: S.margin, leverage: S.leverage, tp: { pct: S.tpPct }, sl: { pct: S.slPct } };
-    // The checks run inside the account+market lock, so a live trial opened meanwhile is never added to.
-    const r = await this.posLock.run(`${tk.owner.toLowerCase()}:${base}`, async () => {
-      const acct = await this.venue.account(u.owner!);
-      if (acct.positions.length) return `skip: the demo account holds ${acct.positions.map((x) => x.base).join(", ")}`;
-      if (acct.equity < S.minEquity) return `skip: equity ${acct.equity.toFixed(2)} below ${S.minEquity}`;
-      return this.openLocked(u, 0, side, p, tk, { via: "schedule", quiet: true });
+    const res = await this.openSandbox(u, "schedule", base, side, {
+      margin: S.margin, leverage: S.leverage, tpPct: S.tpPct, slPct: S.slPct, holdMs: S.maxHoldMs,
+      check: async () => {
+        const acct = await this.venue.account(u.owner!);
+        if (acct.positions.length || this.jobs.all().length) { return `wait: the demo account is busy (${acct.positions.map((x) => x.base).join(", ") || "a pending job"})`; }
+        writeAtomic(this.schedFile(), JSON.stringify({ lastSlot: slot, runs })); // recorded before the send: a crash never repeats a slot
+        if (acct.equity < S.minEquity) return `skip: equity ${acct.equity.toFixed(2)} below ${S.minEquity}`;
+        return undefined;
+      },
     });
-    if (typeof r === "string") return r;
-    if (!r || r.filledBase === 0) return `skip: nothing filled on ${base}`;
-    this.sandboxPos.set(base, r.hash);
-    setTimeout(() => void this.scheduledFlatten(u, base, side, r.hash).catch((e) => log("scheduled flatten failed", base, String(e).slice(0, 160))), S.maxHoldMs).unref();
-    return `opened ${side} ${base} ${r.filledBase} (tx ${r.hash})`;
-  }
-
-  /** The scheduled position is still open after maxHoldMs (neither TP nor SL fired): close it at market, quietly. */
-  async scheduledFlatten(u: User, base: string, side: Side, token: string): Promise<void> {
-    if (this.sandboxPos.get(base) !== token) return; // closed meanwhile and something else opened there: not ours
-    this.sandboxPos.delete(base);
-    if (u.owner?.toLowerCase() !== this.demoAccount.toLowerCase()) return;
-    const pos = (await this.venue.account(u.owner)).positions.find((x) => x.base === base);
-    if (!pos || pos.side !== side) return;
-    await this.doClose(u, 0, base, 1, `scheduled flatten after ${Math.round(DEMO_SCHEDULE.maxHoldMs / 60_000)} min`, { expectSide: side, auto: true });
-    log("demo schedule: flattened", base);
+    if (res.refused) return res.refused;
+    if (!res.r || res.r.filledBase === 0) return `skip: nothing filled on ${base}`;
+    return `opened ${side} ${base} ${res.r.filledBase} (tx ${res.r.hash})`;
   }
 
   // ---------- /try: one real order on the bot's sandbox account, no wallet (off unless data/try.on) ----------
@@ -929,54 +1002,57 @@ export class Bot {
       TRY.markets.map((b) => [{ text: `Long ${b}`, callback_data: `ty:${b}:l` }, { text: `Short ${b}`, callback_data: `ty:${b}:s` }]));
   }
 
-  /** One trial order. Every check happens again inside the account+market lock, right before the send. */
+  /** Why no trial can start now, from memory only (no chain reads): busy market, too many open, a scheduled slot. */
+  private trySandboxBusy(base: string, now = Date.now()): string | undefined {
+    const jobs = this.jobs.all();
+    if (jobs.some((j) => j.kind === "schedule")) return "The sandbox is running its scheduled trade. Try again in a few minutes, or look at /demo.";
+    const d = new Date(now);
+    if (DEMO_SCHEDULE.hoursUtc.includes(d.getUTCHours()) && d.getUTCMinutes() >= DEMO_SCHEDULE.minute - 5 && this.loadSched().lastSlot !== d.toISOString().slice(0, 13)) return "The sandbox is about to run its scheduled trade. Try again in a few minutes.";
+    if (jobs.some((j) => j.base === base)) return `The sandbox already holds a ${base}-PERP trial. Pick another market or try again in a few minutes.`;
+    if (jobs.length >= TRY.maxOpen) return "The sandbox is busy with other trials. Try again in a few minutes, or look at /demo.";
+    return undefined;
+  }
+
+  /** One trial order: cheap memory checks first, then everything again under one sandbox-wide lock. */
   private async tryOrder(id: number, chat: number, base: string, side: Side): Promise<void> {
     if (!this.tryEnabled()) { await this.say(chat, "Live trials are off right now. /demo shows the bot's live account."); return; }
     this.notStopping();
-    let refused: string | undefined;
-    try { refused = this.tryCaps.refusal(id); } catch (e) {
-      log("trial caps unreadable:", String(e).slice(0, 120));
-      await this.say(chat, "Live trials are not available right now."); return; // fail closed
-    }
-    if (refused) { await this.say(chat, h(refused)); return; }
-    const demo = this.demoAccount.toLowerCase();
-    const u = this.store.all().find((x) => x.owner?.toLowerCase() === demo && hasKey(x));
-    if (!u || !this.venue.market(base) || !(TRY.markets as readonly string[]).includes(base)) { await this.say(chat, "Live trials are not available right now."); return; }
-    const tk = this.tk(u);
-    const r = await this.posLock.run(`${tk.owner.toLowerCase()}:${base}`, async () => {
-      const acct = await this.venue.account(tk.owner);
-      if (acct.positions.some((p) => p.base === base)) throw new UserError(`The sandbox already holds a ${base}-PERP trial. Pick another market or try again in a few minutes.`);
-      if (acct.positions.length >= TRY.maxOpen) throw new UserError("The sandbox is busy with other trials. Try again in a few minutes, or look at /demo.");
-      if (acct.equity < TRY.minEquity) throw new UserError("The sandbox account is resting (low balance). /demo shows its orders.");
-      if ((await this.venue.gasBalance(u.keyAddress!)) < TRY.minGasStt) throw new UserError("The sandbox is resting (low gas). /demo shows its orders.");
-      this.tryCaps.take(id); // counted before the send: a failed send still uses the trial (no retry loops)
-      log("trial", base, side);
-      const p: OpenCmd = { kind: "open", side, base, margin: TRY.margin, leverage: TRY.leverage, tp: { pct: TRY.tpPct }, sl: { pct: TRY.slPct } };
-      return this.openLocked(u, 0, side, p, tk, { via: "try", quiet: true, maxTouchPct: TRY.maxTouchPct });
+    if (!(TRY.markets as readonly string[]).includes(base) || !this.venue.market(base)) { await this.say(chat, "Live trials are not available right now."); return; }
+    if (!this.buckets.allow(`trycd:${id}`, 1, TRY.userCooldownMs)) { await this.say(chat, "One moment between trials, please."); return; }
+    let busy: string | undefined;
+    try { busy = this.trySandboxBusy(base); } catch { await this.say(chat, "Live trials are not available right now."); return; }
+    if (busy) { await this.say(chat, h(busy)); return; }
+    if (!this.buckets.allow("try:all", TRY.globalPerMinute, 60_000)) { await this.say(chat, "Lots of trials right now. Try again in a minute."); return; }
+    const u = this.demoUser();
+    if (!u) { await this.say(chat, "Live trials are not available right now."); return; }
+    const res = await this.posLock.run("sandbox:try", async () => {
+      let refused: string | undefined;
+      try { refused = this.tryCaps.refusal(id) ?? this.trySandboxBusy(base); } catch (e) {
+        log("trial state unreadable:", String(e).slice(0, 120));
+        return { refused: "Live trials are not available right now." }; // fail closed
+      }
+      if (refused) return { refused };
+      return this.openSandbox(u, "try", base, side, {
+        margin: TRY.margin, leverage: TRY.leverage, tpPct: TRY.tpPct, slPct: TRY.slPct, holdMs: TRY.maxHoldMs, chat,
+        check: async () => {
+          const acct = await this.venue.account(u.owner!);
+          if (acct.positions.some((p) => p.base === base)) return `The sandbox already holds a ${base}-PERP position. Pick another market or try again in a few minutes.`;
+          if (acct.positions.length >= TRY.maxOpen) return "The sandbox is busy with other trials. Try again in a few minutes, or look at /demo.";
+          if (acct.equity < TRY.minEquity) return "The sandbox account is resting (low balance). /demo shows its orders.";
+          if ((await this.venue.gasBalance(u.keyAddress)) < TRY.minGasStt) return "The sandbox is resting (low gas). /demo shows its orders.";
+          this.tryCaps.take(id); // counted before the send: a failed send still uses the trial (no retry loops)
+          log("trial", base, side);
+          return undefined;
+        },
+      });
     });
+    if (res.refused) { await this.say(chat, h(res.refused)); return; }
+    const r = res.r;
     if (!r || r.filledBase === 0) { await this.say(chat, `Nothing filled (the book moved)${r ? `: tx ${txLink(r.hash)}` : ""}. No position was opened.`); return; }
-    const at = Date.now();
-    this.sandboxPos.set(base, r.hash);
     await this.say(chat,
-      `<b>Filled</b> ${side} ${r.filledBase} ${base} @ ${r.avgPrice ? fmtPrice(r.avgPrice) : "?"} on the sandbox account ${addrLink(tk.owner)}\nTx ${txLink(r.hash)}\n` +
+      `<b>Filled</b> ${side} ${r.filledBase} ${base} @ ${r.avgPrice ? fmtPrice(r.avgPrice) : "?"} on the sandbox account ${addrLink(this.demoAccount)}\nTx ${txLink(r.hash)}\n` +
       `It closes by itself at ±${TRY.tpPct}% or within ${Math.round(TRY.maxHoldMs / 60_000)} minutes; I tell you how it ended. To trade your own account: /start.`,
       [[{ text: "Start trading", callback_data: "st" }]]);
-    setTimeout(() => void this.tryEnded(u, chat, base, side, at, r.hash).catch((e) => log("trial end failed", base, String(e).slice(0, 160))), TRY.maxHoldMs).unref();
-  }
-
-  /** maxHoldMs after a trial: close it if no exit fired, then tell the trier how it ended (from the order log). */
-  private async tryEnded(u: User, chat: number, base: string, side: Side, at: number, token: string): Promise<void> {
-    const mine = this.sandboxPos.get(base) === token;
-    if (mine) this.sandboxPos.delete(base);
-    if (mine && u.owner?.toLowerCase() === this.demoAccount.toLowerCase()) {
-      const pos = (await this.venue.account(u.owner)).positions.find((x) => x.base === base);
-      if (pos && pos.side === side) await this.doClose(u, 0, base, 1, `trial closed after ${Math.round(TRY.maxHoldMs / 60_000)} min`, { expectSide: side, auto: true }).catch(() => undefined);
-    }
-    // The first close on that market after this trial opened is this trial's (one position per market at a time).
-    const close = this.store.recentOrders(this.demoAccount, 20).filter((x) => x.kind === "close" && x.market === `${base}-PERP` && Date.parse(x.t) >= at).at(-1);
-    await this.say(chat, close
-      ? `Your ${base}-PERP trial is closed${close.avgPrice !== undefined ? ` @ ${fmtPrice(close.avgPrice)}` : ""}${autoKind(close.reason) ? ` by its ${autoKind(close.reason)}` : ""}. Tx ${txLink(close.hash)}`
-      : `Your ${base}-PERP trial: I could not confirm the close yet. /demo shows the sandbox account.`);
   }
 
   // ---------- /stops: dreamDEX's chain-held TP/SL, mirrored and checked ----------

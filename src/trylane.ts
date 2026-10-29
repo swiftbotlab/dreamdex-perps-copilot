@@ -2,7 +2,8 @@
 // account, outside the Perps Arena), with no wallet and no link. This module holds only the caps and their state;
 // bot.ts places the order through the normal open path. Off unless data/try.on exists (and never while
 // data/try.off exists). Fails closed: any doubt (state unreadable, caps reached, sandbox low) means no order.
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
+import { writeAtomic } from "./sandbox.ts";
 
 export const TRY = {
   markets: ["ETH", "SOL", "XRP"] as const,
@@ -11,8 +12,9 @@ export const TRY = {
   maxHoldMs: 10 * 60_000,              // flattened after 10 minutes if no exit fired
   perUserPerDay: 2, globalPerDay: 12,  // UTC days
   maxOpen: 2,                          // sandbox positions at once (one per market)
-  minEquity: 2.8, minGasStt: 1,        // keep a reserve for exits and scheduled trades
-  maxTouchPct: 0.5,                    // refuse a book further than 0.5% from the mark, never fill beyond it
+  minEquity: 3.0, minGasStt: 1,        // above the schedule's 2.8 floor: trials stop first, the evidence trades go on
+  userCooldownMs: 30_000,              // one trial tap per person per 30 s
+  globalPerMinute: 4,                  // all people together
 };
 
 interface State { day: string; global: number; users: Record<string, number> }
@@ -47,6 +49,6 @@ export class TryCaps {
     s.global++;
     s.users[String(userId)] = (s.users[String(userId)] ?? 0) + 1;
     if (Object.keys(s.users).length > 5_000) throw new Error("too many trial users today");
-    writeFileSync(this.file, JSON.stringify(s), { mode: 0o600 });
+    writeAtomic(this.file, JSON.stringify(s));
   }
 }
