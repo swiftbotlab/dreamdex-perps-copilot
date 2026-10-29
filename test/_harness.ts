@@ -1,9 +1,10 @@
 // Shared test harness (not a test file): a Bot with a fake Telegram, a fake venue and a stub protector.
 // No network, no chain: every send is recorded. Env is set before the bot module is loaded.
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 
 const root = mkdtempSync(`${tmpdir()}/ddmvp-h-`);
+process.on("exit", () => rmSync(root, { recursive: true, force: true }));
 writeFileSync(`${root}/bot.env`, "BOT_TOKEN=123456:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n");
 writeFileSync(`${root}/master.env`, `DDMVP_MASTER_KEY=${"33".repeat(32)}\n`);
 process.env.DDMVP_BOT_ENV = `${root}/bot.env`;
