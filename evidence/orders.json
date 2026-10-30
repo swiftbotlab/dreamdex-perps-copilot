@@ -1,12 +1,12 @@
 {
- "generated": "2026-10-29T20:28:59.306Z",
+ "generated": "2026-10-30T04:28:28.296Z",
  "chainId": 50383,
  "accounts": [
   "0x2a11e7388d1d2f9690f2636846d44b478f61bf08",
   "0x0e7e8df6eac2e14165b4fa4cb2bd4e445d0e3817"
  ],
- "verified": 39,
- "total": 39,
+ "verified": 41,
+ "total": 41,
  "orders": [
   {
    "time": "2026-10-20T13:43:08Z",
@@ -786,6 +786,46 @@
    "account": "0x2A11e7388D1D2F9690f2636846d44b478f61bF08",
    "gasUsed": 652171,
    "triggerToCloseS": 2.913,
+   "triggerSource": "push"
+  },
+  {
+   "time": "2026-10-30T03:44:25Z",
+   "logged": "2026-10-30T03:44:25.749Z",
+   "kind": "open",
+   "reason": null,
+   "via": "schedule",
+   "market": "SOL-PERP",
+   "side": "long",
+   "filled": 0.12,
+   "avgPrice": 96.84,
+   "hash": "0x56b35bf1a1ec2cee3cc54058c663b020531be41f71ff40ab937b8de1042b1333",
+   "block": 36786447,
+   "status": "success",
+   "verified": true,
+   "from": "0xdd5ddd125d6a9b3d4641e5bdb5456e5ec098fb18",
+   "account": "0x2A11e7388D1D2F9690f2636846d44b478f61bF08",
+   "gasUsed": 1518159,
+   "triggerToCloseS": null,
+   "triggerSource": null
+  },
+  {
+   "time": "2026-10-30T04:17:08Z",
+   "logged": "2026-10-30T04:17:08.672Z",
+   "kind": "close",
+   "reason": "take-profit 97.131 reached (mark 97.250)",
+   "via": null,
+   "market": "SOL-PERP",
+   "side": "short",
+   "filled": 0.12,
+   "avgPrice": 97.26,
+   "hash": "0xf3beed63e8804e343177f408901120b0f7ecf3e756922b4149e7e8f7d2f1a768",
+   "block": 36806072,
+   "status": "success",
+   "verified": true,
+   "from": "0xdd5ddd125d6a9b3d4641e5bdb5456e5ec098fb18",
+   "account": "0x2A11e7388D1D2F9690f2636846d44b478f61bF08",
+   "gasUsed": 685868,
+   "triggerToCloseS": 2.828,
    "triggerSource": "push"
   }
  ]
