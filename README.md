@@ -18,7 +18,7 @@ Live on Somnia Tokyo testnet: [@SwiftPerpsBot](https://t.me/SwiftPerpsBot). Buil
 Then `/start`, Link a bot in the app, and `/long ETH 20 5x tp 4% sl 2%`.
 
 <!-- evidence:headline -->
-**Evidence.** 41 real orders sent by the bot, 41 verified `success` on chain, 11 of them exits the bot fired by itself, on 4 days (newest 2026-10-30 04:17 UTC), 2 of them scheduled demo trades; scheduled demo trades keep adding three a day until Nov 1. Latest measured time from the pushed mark crossing a TP/SL level to the confirmed close: 2.8 s.
+**Evidence.** 43 real orders sent by the bot, 43 verified `success` on chain, 12 of them exits the bot fired by itself, on 4 days (newest 2026-10-30 11:47 UTC), 3 of them scheduled demo trades; scheduled demo trades keep adding three a day until Nov 1. Latest measured time from the pushed mark crossing a TP/SL level to the confirmed close: 2.9 s.
 <!-- /evidence:headline -->
 - Evidence page (every order re-read from its receipt, the chain-held stop check run step by step): **https://swiftbotlab.github.io/dreamdex-perps-copilot/**
 - **Chain-fired stop-loss, live:** with the bot process stopped, Somnia Reactivity woke our ExitGuard contract on the demo account (an EIP-7702 account) and it closed the bot-opened HYPE long by itself. [How and the tx hashes](#chain-fired-stop-loss-exitguard).
@@ -140,14 +140,16 @@ All orders were placed **by the bot**, through a bot key linked to the account w
 Accounts: from 2026-10-29 the demo account is `0x2A11e7388D1D2F9690f2636846d44b478f61bF08`, an account outside the Perps Arena holding testnet USDso bought with faucet STT. The orders of 2026-10-20 and 2026-10-26 went to the earlier demo account `0x0e7E8DF6Eac2E14165b4fA4CB2BD4e445d0E3817` (paper USDso from its own airdrop); `/demo` counts both.
 
 <!-- evidence:summary -->
-41 orders (21 opens, 20 closes), 41/41 verified `success`: 24 on 2026-10-20, 4 on 2026-10-26, 11 on 2026-10-29, 2 on 2026-10-30. 11 closes were fired by the bot itself (take-profit, stop-loss or guard). All of them are on our own demo accounts; the bot has had no outside users yet. Generated 2026-10-30 04:28 UTC.
+43 orders (22 opens, 21 closes), 43/43 verified `success`: 24 on 2026-10-20, 4 on 2026-10-26, 11 on 2026-10-29, 4 on 2026-10-30. 12 closes were fired by the bot itself (take-profit, stop-loss or guard). All of them are on our own demo accounts; the bot has had no outside users yet. Generated 2026-10-30 12:27 UTC.
 <!-- /evidence:summary -->
 
 <!-- evidence:latest -->
-Newest 10 (all 41 in [evidence/orders.md](evidence/orders.md)):
+Newest 10 (all 43 in [evidence/orders.md](evidence/orders.md)):
 
 | UTC | action | market | filled | avg price | tx | status | trigger to close |
 |---|---|---|---|---|---|---|---|
+| 10-30 11:47 | close, take-profit (bot) | ETH-PERP long | 0.0053 | 2236.01 | [`0x0fcfa413…`](https://explorer.testnet.somnia.network/tokyo/tx/0x0fcfa4134d6b6ee1ea02d8ad52d80b4e8e290aade26d149b72323b8677de3704) | success | 2.9 s |
+| 10-30 11:20 | open, scheduled | ETH-PERP short | 0.0053 | 2243.48 | [`0xab7469e9…`](https://explorer.testnet.somnia.network/tokyo/tx/0xab7469e998aa9671692d8f32c4078eb2e373c60ad77b88feacde791467d7b693) | success |  |
 | 10-30 04:17 | close, take-profit (bot) | SOL-PERP short | 0.12 | 97.26 | [`0xf3beed63…`](https://explorer.testnet.somnia.network/tokyo/tx/0xf3beed63e8804e343177f408901120b0f7ecf3e756922b4149e7e8f7d2f1a768) | success | 2.8 s |
 | 10-30 03:44 | open, scheduled | SOL-PERP long | 0.12 | 96.84 | [`0x56b35bf1…`](https://explorer.testnet.somnia.network/tokyo/tx/0x56b35bf1a1ec2cee3cc54058c663b020531be41f71ff40ab937b8de1042b1333) | success |  |
 | 10-29 19:32 | close, stop-loss (bot) | XRP-PERP long | 9.3 | 1.2872 | [`0xb1199903…`](https://explorer.testnet.somnia.network/tokyo/tx/0xb11999037a1901e7e203179996412e51a7a471e667acb970426f834f5fc80bcc) | success | 2.9 s |
@@ -156,8 +158,6 @@ Newest 10 (all 41 in [evidence/orders.md](evidence/orders.md)):
 | 10-29 06:07 | open | HYPE-PERP long | 0.12 | 79.31 | [`0x83107465…`](https://explorer.testnet.somnia.network/tokyo/tx/0x83107465b11200f9cb2969b70f416be5a38128e84c9bd47baa25b8280cdfbe48) | success |  |
 | 10-29 05:24 | open | HYPE-PERP long | 0.12 | 79.37 | [`0x1722a8ce…`](https://explorer.testnet.somnia.network/tokyo/tx/0x1722a8ce06557ccbf2afdb3f0ce39d9c886fb23b91d488ea8bb1db2325e3d030) | success |  |
 | 10-29 02:14 | close, stop-loss (bot) | ETH-PERP short | 0.0052 | 2301.86 | [`0xa148b523…`](https://explorer.testnet.somnia.network/tokyo/tx/0xa148b523b3cec41ad18b38e038fcad96018607f1dd3e93c59c6f8b1cf3a51d62) | success | 2.5 s |
-| 10-29 02:08 | open | ETH-PERP long | 0.0052 | 2307.05 | [`0x19550901…`](https://explorer.testnet.somnia.network/tokyo/tx/0x195509016abd538ef75a14878fadf0bb17c1d71bead1439d29937262927aaba7) | success |  |
-| 10-29 01:16 | close | XRP-PERP short | 9.1 | 1.3173 | [`0x2e6d136d…`](https://explorer.testnet.somnia.network/tokyo/tx/0x2e6d136d76c96a6ee7e79d711d0fb7cfab8c8cea9b8dc3c764c1a3ffae275c79) | success |  |
 <!-- /evidence:latest -->
 
 ### Card copy evidence (live, 2026-10-26)
