@@ -1,6 +1,6 @@
 # Orders placed by the bot on Somnia Tokyo testnet (Hideki, chain 50383)
 
-Generated 2026-10-31T04:28:40.341Z by scripts/evidence.ts from the bot's order log, every row re-read from the chain: 47/47 receipts are `success`, sent by the user's linked bot key and calling `placeOrderFor(account, ...)` on the market's perp pool. "via card" marks an order opened from a shared card (Copy this trade).
+Generated 2026-10-31T12:29:03.840Z by scripts/evidence.ts from the bot's order log, every row re-read from the chain: 49/49 receipts are `success`, sent by the user's linked bot key and calling `placeOrderFor(account, ...)` on the market's perp pool. "via card" marks an order opened from a shared card (Copy this trade).
 
 Accounts: `0x2a11e7388d1d2f9690f2636846d44b478f61bf08`, `0x0e7e8df6eac2e14165b4fa4cb2bd4e445d0e3817`. "trigger to close" (bot exits from 2026-10-29): time from the mark update that crossed the level to the confirmed close, from the bot's own clock.
 
@@ -53,3 +53,5 @@ Accounts: `0x2a11e7388d1d2f9690f2636846d44b478f61bf08`, `0x0e7e8df6eac2e14165b4f
 | 10-30 19:25:41 | close (take-profit) |  | XRP-PERP | short | 9.7 | 1.2418 | [0x8abbbbf8fb…](https://explorer.testnet.somnia.network/tokyo/tx/0x8abbbbf8fbd7e910c510a68aaa293804548f6c2cd1267e440f4acb55ca4b683e) | 37350982 | success | 2.1 s | `0x2A11…bF08` |
 | 10-31 03:20:30 | open | schedule | SOL-PERP | short | 0.12 | 96.79 | [0xb0c512dfa5…](https://explorer.testnet.somnia.network/tokyo/tx/0xb0c512dfa57ec7334fa80c6cec819788fef7a9cc4ff36d1f1fe8a776403a326d) | 37635786 | success |  | `0x2A11…bF08` |
 | 10-31 03:38:59 | close (take-profit) |  | SOL-PERP | long | 0.12 | 96.49 | [0x0e69b81140…](https://explorer.testnet.somnia.network/tokyo/tx/0x0e69b81140ca2a95bba8a580df25180efa89940493411ff722ae0cceea769c63) | 37646872 | success | 2.7 s | `0x2A11…bF08` |
+| 10-31 11:20:46 | open | schedule | ETH-PERP | long | 0.0053 | 2242.34 | [0xcb65d13dfc…](https://explorer.testnet.somnia.network/tokyo/tx/0xcb65d13dfcbf7ddf68c74afde757baa02b0f2ee22fcb1e1b96dfad608be40ab3) | 37923865 | success |  | `0x2A11…bF08` |
+| 10-31 12:06:46 | close (scheduled) |  | ETH-PERP | short | 0.0053 | 2246.36 | [0xb0ce8d0fb5…](https://explorer.testnet.somnia.network/tokyo/tx/0xb0ce8d0fb5f3087e5364487464af5699c9f4c06ae308b2cf9d8a6416880450e0) | 37951455 | success |  | `0x2A11…bF08` |

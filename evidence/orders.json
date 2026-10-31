@@ -1,12 +1,12 @@
 {
- "generated": "2026-10-31T04:28:40.341Z",
+ "generated": "2026-10-31T12:29:03.840Z",
  "chainId": 50383,
  "accounts": [
   "0x2a11e7388d1d2f9690f2636846d44b478f61bf08",
   "0x0e7e8df6eac2e14165b4fa4cb2bd4e445d0e3817"
  ],
- "verified": 47,
- "total": 47,
+ "verified": 49,
+ "total": 49,
  "orders": [
   {
    "time": "2026-10-20T13:43:08Z",
@@ -947,6 +947,46 @@
    "gasUsed": 719574,
    "triggerToCloseS": 2.658,
    "triggerSource": "push"
+  },
+  {
+   "time": "2026-10-31T11:20:46Z",
+   "logged": "2026-10-31T11:20:47.170Z",
+   "kind": "open",
+   "reason": null,
+   "via": "schedule",
+   "market": "ETH-PERP",
+   "side": "long",
+   "filled": 0.0053,
+   "avgPrice": 2242.34,
+   "hash": "0xcb65d13dfcbf7ddf68c74afde757baa02b0f2ee22fcb1e1b96dfad608be40ab3",
+   "block": 37923865,
+   "status": "success",
+   "verified": true,
+   "from": "0xdd5ddd125d6a9b3d4641e5bdb5456e5ec098fb18",
+   "account": "0x2A11e7388D1D2F9690f2636846d44b478f61bF08",
+   "gasUsed": 1676601,
+   "triggerToCloseS": null,
+   "triggerSource": null
+  },
+  {
+   "time": "2026-10-31T12:06:46Z",
+   "logged": "2026-10-31T12:06:46.979Z",
+   "kind": "close",
+   "reason": "scheduled flatten after 45 min",
+   "via": null,
+   "market": "ETH-PERP",
+   "side": "short",
+   "filled": 0.0053,
+   "avgPrice": 2246.36,
+   "hash": "0xb0ce8d0fb5f3087e5364487464af5699c9f4c06ae308b2cf9d8a6416880450e0",
+   "block": 37951455,
+   "status": "success",
+   "verified": true,
+   "from": "0xdd5ddd125d6a9b3d4641e5bdb5456e5ec098fb18",
+   "account": "0x2A11e7388D1D2F9690f2636846d44b478f61bF08",
+   "gasUsed": 1553381,
+   "triggerToCloseS": null,
+   "triggerSource": null
   }
  ]
 }
