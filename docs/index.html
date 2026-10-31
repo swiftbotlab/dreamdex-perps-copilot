@@ -49,10 +49,10 @@ footer { margin-top:40px; color:var(--mut); font-size:.85rem; }
 <div class="links"><a href="https://t.me/SwiftPerpsBot">Open @SwiftPerpsBot</a><a href="https://github.com/swiftbotlab/dreamdex-perps-copilot">GitHub repo</a><a href="https://youtu.be/rWLEHY_x_j4">Demo video</a><a href="https://github.com/swiftbotlab/dreamdex-perps-copilot/blob/main/evidence/orders.md">Order table (Markdown)</a><a href="https://github.com/swiftbotlab/dreamdex-perps-copilot/blob/main/evidence/orders.csv">CSV</a></div>
 
 <div class="tiles">
-<div class="tile"><b>45</b><span>orders the bot sent on chain, 45 verified <code>success</code></span></div>
-<div class="tile"><b>13</b><span>exits the bot fired by itself (take-profit, stop-loss, guard)</span></div>
-<div class="tile"><b>2.1 s</b><span>from the pushed mark crossing a TP/SL level to the confirmed close (latest of 6 measured)</span></div>
-<div class="tile"><b>4</b><span>days with orders; newest 2026-10-30 19:25 UTC, 4 scheduled</span></div>
+<div class="tile"><b>47</b><span>orders the bot sent on chain, 47 verified <code>success</code></span></div>
+<div class="tile"><b>14</b><span>exits the bot fired by itself (take-profit, stop-loss, guard)</span></div>
+<div class="tile"><b>2.7 s</b><span>from the pushed mark crossing a TP/SL level to the confirmed close (latest of 7 measured)</span></div>
+<div class="tile"><b>5</b><span>days with orders; newest 2026-10-31 03:38 UTC, 5 scheduled</span></div>
 </div>
 
 <h2>Try it in 60 seconds</h2>
@@ -116,6 +116,8 @@ footer { margin-top:40px; color:var(--mut); font-size:.85rem; }
 <div class="scroll"><table>
 <thead><tr><th>UTC</th><th>action</th><th>market</th><th>filled</th><th>avg price</th><th>tx</th><th>block</th><th>status</th><th>trigger→close</th><th>account</th></tr></thead>
 <tbody>
+<tr><td>10-31 03:38</td><td>close · take-profit (bot)</td><td>SOL-PERP long</td><td class="n">0.12</td><td class="n">96.49</td><td><a href="https://explorer.testnet.somnia.network/tokyo/tx/0x0e69b81140ca2a95bba8a580df25180efa89940493411ff722ae0cceea769c63"><code>0x0e69b811…769c63</code></a></td><td class="n">37646872</td><td><span class="ok">success</span></td><td class="n">2.7 s</td><td><a href="https://explorer.testnet.somnia.network/tokyo/address/0x2A11e7388D1D2F9690f2636846d44b478f61bF08"><code>0x2A11…bF08</code></a></td></tr>
+<tr><td>10-31 03:20</td><td>open · scheduled</td><td>SOL-PERP short</td><td class="n">0.12</td><td class="n">96.79</td><td><a href="https://explorer.testnet.somnia.network/tokyo/tx/0xb0c512dfa57ec7334fa80c6cec819788fef7a9cc4ff36d1f1fe8a776403a326d"><code>0xb0c512df…3a326d</code></a></td><td class="n">37635786</td><td><span class="ok">success</span></td><td class="n"></td><td><a href="https://explorer.testnet.somnia.network/tokyo/address/0x2A11e7388D1D2F9690f2636846d44b478f61bF08"><code>0x2A11…bF08</code></a></td></tr>
 <tr><td>10-30 19:25</td><td>close · take-profit (bot)</td><td>XRP-PERP short</td><td class="n">9.7</td><td class="n">1.2418</td><td><a href="https://explorer.testnet.somnia.network/tokyo/tx/0x8abbbbf8fbd7e910c510a68aaa293804548f6c2cd1267e440f4acb55ca4b683e"><code>0x8abbbbf8…4b683e</code></a></td><td class="n">37350982</td><td><span class="ok">success</span></td><td class="n">2.1 s</td><td><a href="https://explorer.testnet.somnia.network/tokyo/address/0x2A11e7388D1D2F9690f2636846d44b478f61bF08"><code>0x2A11…bF08</code></a></td></tr>
 <tr><td>10-30 19:20</td><td>open · scheduled</td><td>XRP-PERP long</td><td class="n">9.7</td><td class="n">1.2373</td><td><a href="https://explorer.testnet.somnia.network/tokyo/tx/0xa1e613593c23fe15380501034c78b5a3099efca502d9552e58e59239eb3a1e25"><code>0xa1e61359…3a1e25</code></a></td><td class="n">37347850</td><td><span class="ok">success</span></td><td class="n"></td><td><a href="https://explorer.testnet.somnia.network/tokyo/address/0x2A11e7388D1D2F9690f2636846d44b478f61bF08"><code>0x2A11…bF08</code></a></td></tr>
 <tr><td>10-30 11:47</td><td>close · take-profit (bot)</td><td>ETH-PERP long</td><td class="n">0.0053</td><td class="n">2236.01</td><td><a href="https://explorer.testnet.somnia.network/tokyo/tx/0x0fcfa4134d6b6ee1ea02d8ad52d80b4e8e290aade26d149b72323b8677de3704"><code>0x0fcfa413…de3704</code></a></td><td class="n">37075901</td><td><span class="ok">success</span></td><td class="n">2.9 s</td><td><a href="https://explorer.testnet.somnia.network/tokyo/address/0x2A11e7388D1D2F9690f2636846d44b478f61bF08"><code>0x2A11…bF08</code></a></td></tr>
@@ -163,7 +165,7 @@ footer { margin-top:40px; color:var(--mut); font-size:.85rem; }
 <tr><td>10-20 13:43</td><td>open</td><td>SOL-PERP long</td><td class="n">0.47</td><td class="n">104.19</td><td><a href="https://explorer.testnet.somnia.network/tokyo/tx/0x7a0b04047f3a6897421d09189d5578443c40faf5eb005c0b581a3f6f19a24729"><code>0x7a0b0404…a24729</code></a></td><td class="n">28518981</td><td><span class="ok">success</span></td><td class="n"></td><td><a href="https://explorer.testnet.somnia.network/tokyo/address/0x0e7E8DF6Eac2E14165b4fA4CB2BD4e445d0E3817"><code>0x0e7E…3817</code></a></td></tr>
 </tbody></table></div>
 
-<footer>Generated 2026-10-30 20:28 UTC (orders) from chain 50383 by <code>scripts/evidence.ts</code> and <code>scripts/evidence_page.ts</code>. Testnet tokens only. Not financial advice. Swift Bot Labs is not affiliated with dreamDEX or Somnia.</footer>
+<footer>Generated 2026-10-31 04:28 UTC (orders) from chain 50383 by <code>scripts/evidence.ts</code> and <code>scripts/evidence_page.ts</code>. Testnet tokens only. Not financial advice. Swift Bot Labs is not affiliated with dreamDEX or Somnia.</footer>
 </main>
 </body>
 </html>
